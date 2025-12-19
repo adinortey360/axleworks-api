@@ -83,12 +83,136 @@ const vehicleSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
 });
 
+// Service Record schema (maintenance data recorded during service visits)
+const serviceRecordSchema = new mongoose.Schema({
+  vehicleId: { type: mongoose.Schema.Types.ObjectId, ref: 'Vehicle', required: true },
+  customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', required: true },
+  recordedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser' },
+  mileageAtService: { type: Number },
+  serviceDate: { type: Date, default: Date.now },
+
+  // Oil
+  oil: {
+    level: { type: String, enum: ['full', 'good', 'low', 'critical', 'not_checked'], default: 'not_checked' },
+    condition: { type: String, enum: ['clean', 'good', 'dirty', 'very_dirty', 'not_checked'], default: 'not_checked' },
+    changed: { type: Boolean, default: false },
+    nextChangeMileage: { type: Number },
+  },
+
+  // Brake Fluid
+  brakeFluid: {
+    level: { type: String, enum: ['full', 'good', 'low', 'critical', 'not_checked'], default: 'not_checked' },
+    condition: { type: String, enum: ['clean', 'good', 'dirty', 'contaminated', 'not_checked'], default: 'not_checked' },
+    changed: { type: Boolean, default: false },
+  },
+
+  // Transmission Fluid
+  transmissionFluid: {
+    level: { type: String, enum: ['full', 'good', 'low', 'critical', 'not_checked'], default: 'not_checked' },
+    condition: { type: String, enum: ['clean', 'good', 'dirty', 'burnt', 'not_checked'], default: 'not_checked' },
+    changed: { type: Boolean, default: false },
+  },
+
+  // Coolant
+  coolant: {
+    level: { type: String, enum: ['full', 'good', 'low', 'critical', 'not_checked'], default: 'not_checked' },
+    condition: { type: String, enum: ['clean', 'good', 'dirty', 'contaminated', 'not_checked'], default: 'not_checked' },
+    changed: { type: Boolean, default: false },
+  },
+
+  // Power Steering Fluid
+  powerSteeringFluid: {
+    level: { type: String, enum: ['full', 'good', 'low', 'critical', 'not_checked'], default: 'not_checked' },
+    changed: { type: Boolean, default: false },
+  },
+
+  // Brake Pads
+  brakePads: {
+    frontLeft: { type: Number, min: 0, max: 100 }, // percentage remaining
+    frontRight: { type: Number, min: 0, max: 100 },
+    rearLeft: { type: Number, min: 0, max: 100 },
+    rearRight: { type: Number, min: 0, max: 100 },
+  },
+
+  // Tires
+  tires: {
+    frontLeft: {
+      treadDepth: { type: Number }, // mm
+      pressure: { type: Number }, // PSI
+      condition: { type: String, enum: ['good', 'fair', 'worn', 'replace', 'not_checked'], default: 'not_checked' },
+    },
+    frontRight: {
+      treadDepth: { type: Number },
+      pressure: { type: Number },
+      condition: { type: String, enum: ['good', 'fair', 'worn', 'replace', 'not_checked'], default: 'not_checked' },
+    },
+    rearLeft: {
+      treadDepth: { type: Number },
+      pressure: { type: Number },
+      condition: { type: String, enum: ['good', 'fair', 'worn', 'replace', 'not_checked'], default: 'not_checked' },
+    },
+    rearRight: {
+      treadDepth: { type: Number },
+      pressure: { type: Number },
+      condition: { type: String, enum: ['good', 'fair', 'worn', 'replace', 'not_checked'], default: 'not_checked' },
+    },
+  },
+
+  // Battery
+  battery: {
+    voltage: { type: Number },
+    health: { type: String, enum: ['good', 'fair', 'weak', 'replace', 'not_checked'], default: 'not_checked' },
+    replaced: { type: Boolean, default: false },
+  },
+
+  // Air Filter
+  airFilter: {
+    condition: { type: String, enum: ['clean', 'good', 'dirty', 'replace', 'not_checked'], default: 'not_checked' },
+    replaced: { type: Boolean, default: false },
+  },
+
+  // Cabin Air Filter
+  cabinAirFilter: {
+    condition: { type: String, enum: ['clean', 'good', 'dirty', 'replace', 'not_checked'], default: 'not_checked' },
+    replaced: { type: Boolean, default: false },
+  },
+
+  // Wipers
+  wipers: {
+    front: { type: String, enum: ['good', 'fair', 'streaking', 'replace', 'not_checked'], default: 'not_checked' },
+    rear: { type: String, enum: ['good', 'fair', 'streaking', 'replace', 'not_checked', 'n/a'], default: 'not_checked' },
+    replaced: { type: Boolean, default: false },
+  },
+
+  // Lights
+  lights: {
+    headlights: { type: String, enum: ['working', 'dim', 'out', 'not_checked'], default: 'not_checked' },
+    taillights: { type: String, enum: ['working', 'out', 'not_checked'], default: 'not_checked' },
+    brakeLights: { type: String, enum: ['working', 'out', 'not_checked'], default: 'not_checked' },
+    turnSignals: { type: String, enum: ['working', 'out', 'not_checked'], default: 'not_checked' },
+  },
+
+  // Overall health score (calculated or manually set)
+  overallHealth: { type: String, enum: ['excellent', 'good', 'fair', 'poor', 'critical'], default: 'good' },
+
+  // Service notes
+  notes: { type: String },
+  recommendations: [{ type: String }],
+
+  // Services performed
+  servicesPerformed: [{ type: String }],
+
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now },
+});
+
 const User = mongoose.model('User', userSchema);
 const AdminUser = mongoose.model('AdminUser', adminUserSchema);
 const Session = mongoose.model('Session', sessionSchema);
 const RefreshToken = mongoose.model('RefreshToken', refreshTokenSchema);
 const Customer = mongoose.model('Customer', customerSchema);
 const Vehicle = mongoose.model('Vehicle', vehicleSchema);
+const ServiceRecord = mongoose.model('ServiceRecord', serviceRecordSchema);
 
 // In-memory OTP storage (short-lived, no need for DB)
 const otpStore: Map<string, { otp: string; expiresAt: number; phone: string; countryCode: string }> = new Map();
@@ -1006,6 +1130,227 @@ app.delete('/api/v1/vehicles/:id', requireAdmin, async (req, res) => {
   } catch (error) {
     console.error('Error deleting vehicle:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// ============================================================================
+// Admin API - Service Records Management
+// ============================================================================
+
+// Create a service record
+app.post('/api/v1/service-records', requireAdmin, async (req, res) => {
+  try {
+    const { vehicleId, ...recordData } = req.body;
+
+    if (!vehicleId) {
+      return res.status(400).json({ success: false, error: 'Vehicle ID is required' });
+    }
+
+    const vehicle = await Vehicle.findById(vehicleId);
+    if (!vehicle) {
+      return res.status(404).json({ success: false, error: 'Vehicle not found' });
+    }
+
+    const serviceRecord = await ServiceRecord.create({
+      vehicleId,
+      customerId: vehicle.customerId,
+      ...recordData,
+    });
+
+    // Update vehicle mileage if provided
+    if (recordData.mileageAtService && recordData.mileageAtService > (vehicle.mileage || 0)) {
+      vehicle.mileage = recordData.mileageAtService;
+      await vehicle.save();
+    }
+
+    res.json({
+      success: true,
+      data: serviceRecord,
+    });
+  } catch (error) {
+    console.error('Error creating service record:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Get all service records (with pagination)
+app.get('/api/v1/service-records', requireAdmin, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 10;
+    const vehicleId = req.query.vehicleId as string;
+
+    const query: any = {};
+    if (vehicleId) {
+      query.vehicleId = vehicleId;
+    }
+
+    const total = await ServiceRecord.countDocuments(query);
+    const records = await ServiceRecord.find(query)
+      .populate('vehicleId', 'make model year licensePlate')
+      .populate('customerId', 'firstName lastName phone')
+      .sort({ serviceDate: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit);
+
+    res.json({
+      success: true,
+      data: records,
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit),
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching service records:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Get service records for a specific vehicle
+app.get('/api/v1/vehicles/:id/service-records', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const records = await ServiceRecord.find({ vehicleId: id })
+      .sort({ serviceDate: -1 })
+      .limit(20);
+
+    res.json({
+      success: true,
+      data: records,
+    });
+  } catch (error) {
+    console.error('Error fetching vehicle service records:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Get a single service record
+app.get('/api/v1/service-records/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const record = await ServiceRecord.findById(id)
+      .populate('vehicleId', 'make model year licensePlate vin')
+      .populate('customerId', 'firstName lastName phone email');
+
+    if (!record) {
+      return res.status(404).json({ success: false, error: 'Service record not found' });
+    }
+
+    res.json({
+      success: true,
+      data: record,
+    });
+  } catch (error) {
+    console.error('Error fetching service record:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Update a service record
+app.put('/api/v1/service-records/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updateData = req.body;
+
+    const record = await ServiceRecord.findByIdAndUpdate(
+      id,
+      { ...updateData, updatedAt: new Date() },
+      { new: true }
+    );
+
+    if (!record) {
+      return res.status(404).json({ success: false, error: 'Service record not found' });
+    }
+
+    res.json({
+      success: true,
+      data: record,
+    });
+  } catch (error) {
+    console.error('Error updating service record:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Delete a service record
+app.delete('/api/v1/service-records/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const record = await ServiceRecord.findByIdAndDelete(id);
+
+    if (!record) {
+      return res.status(404).json({ success: false, error: 'Service record not found' });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error deleting service record:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// ============================================================================
+// Mobile App - Service Data Endpoint
+// ============================================================================
+
+// Get latest service data for a vehicle (mobile app)
+app.get('/auth/vehicles/:id/service-data', async (req, res) => {
+  try {
+    const auth = await getAuthenticatedUserAndCustomer(req, res);
+    if (!auth) return;
+
+    const { id } = req.params;
+
+    // Verify vehicle belongs to this customer
+    const vehicle = await Vehicle.findOne({ _id: id, customerId: auth.customer._id, isActive: true });
+    if (!vehicle) {
+      return res.status(404).json({ error: 'Vehicle not found' });
+    }
+
+    // Get the latest service record
+    const latestRecord = await ServiceRecord.findOne({ vehicleId: id })
+      .sort({ serviceDate: -1 });
+
+    if (!latestRecord) {
+      return res.json({
+        success: true,
+        hasServiceData: false,
+        serviceData: null,
+      });
+    }
+
+    res.json({
+      success: true,
+      hasServiceData: true,
+      serviceData: {
+        serviceDate: latestRecord.serviceDate,
+        mileageAtService: latestRecord.mileageAtService,
+        oil: latestRecord.oil,
+        brakeFluid: latestRecord.brakeFluid,
+        transmissionFluid: latestRecord.transmissionFluid,
+        coolant: latestRecord.coolant,
+        powerSteeringFluid: latestRecord.powerSteeringFluid,
+        brakePads: latestRecord.brakePads,
+        tires: latestRecord.tires,
+        battery: latestRecord.battery,
+        airFilter: latestRecord.airFilter,
+        cabinAirFilter: latestRecord.cabinAirFilter,
+        wipers: latestRecord.wipers,
+        lights: latestRecord.lights,
+        overallHealth: latestRecord.overallHealth,
+        notes: latestRecord.notes,
+        recommendations: latestRecord.recommendations,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching service data:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
