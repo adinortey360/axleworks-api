@@ -15,6 +15,10 @@ app.use(express.json());
 const userSchema = new mongoose.Schema({
   phone: { type: String, required: true },
   countryCode: { type: String, required: true },
+  firstName: { type: String },
+  lastName: { type: String },
+  email: { type: String },
+  profileComplete: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now },
 });
 userSchema.index({ phone: 1, countryCode: 1 }, { unique: true });
@@ -171,6 +175,10 @@ app.post('/auth/verify-otp', async (req, res) => {
         id: user._id,
         phone: user.phone,
         countryCode: user.countryCode,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        email: user.email,
+        profileComplete: user.profileComplete || false,
       },
     });
   } catch (error) {
@@ -212,6 +220,10 @@ app.get('/auth/me', async (req, res) => {
         id: user._id,
         phone: user.phone,
         countryCode: user.countryCode,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        email: user.email,
+        profileComplete: user.profileComplete || false,
       },
     });
   } catch (error) {
@@ -230,6 +242,63 @@ app.post('/auth/logout', async (req, res) => {
   }
 
   res.json({ success: true });
+});
+
+// Update user profile
+app.put('/auth/profile', async (req, res) => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+
+  const token = authHeader.substring(7);
+
+  try {
+    const session = await Session.findOne({ token, userType: 'user' });
+
+    if (!session) {
+      return res.status(401).json({ error: 'Invalid session' });
+    }
+
+    if (new Date(session.expiresAt) < new Date()) {
+      await Session.deleteOne({ token });
+      return res.status(401).json({ error: 'Session expired' });
+    }
+
+    const { firstName, lastName, email } = req.body;
+
+    const user = await User.findByIdAndUpdate(
+      session.userId,
+      {
+        firstName,
+        lastName,
+        email,
+        profileComplete: true,
+      },
+      { new: true }
+    );
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      success: true,
+      user: {
+        id: user._id,
+        phone: user.phone,
+        countryCode: user.countryCode,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        email: user.email,
+        profileComplete: user.profileComplete,
+      },
+    });
+  } catch (error) {
+    console.error('Error updating profile:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // ============================================================================
