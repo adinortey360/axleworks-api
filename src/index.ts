@@ -209,6 +209,37 @@ const serviceRecordSchema = new mongoose.Schema({
   updatedAt: { type: Date, default: Date.now },
 });
 
+// Service Entry schema (individual service records with type-specific data)
+const serviceEntrySchema = new mongoose.Schema({
+  vehicleId: { type: mongoose.Schema.Types.ObjectId, ref: 'Vehicle', required: true },
+  customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', required: true },
+  recordedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser' },
+  serviceType: {
+    type: String,
+    enum: [
+      'oil_change',
+      'brake_service',
+      'tire_service',
+      'battery_service',
+      'fluid_service',
+      'filter_service',
+      'wiper_service',
+      'light_check',
+      'general_inspection',
+    ],
+    required: true,
+  },
+  serviceDate: { type: Date, default: Date.now },
+  mileageAtService: { type: Number },
+  // Type-specific data stored as flexible object
+  data: { type: mongoose.Schema.Types.Mixed },
+  notes: { type: String },
+  cost: { type: Number },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now },
+});
+serviceEntrySchema.index({ vehicleId: 1, serviceType: 1, serviceDate: -1 });
+
 const User = mongoose.model('User', userSchema);
 const AdminUser = mongoose.model('AdminUser', adminUserSchema);
 const Session = mongoose.model('Session', sessionSchema);
@@ -216,6 +247,7 @@ const RefreshToken = mongoose.model('RefreshToken', refreshTokenSchema);
 const Customer = mongoose.model('Customer', customerSchema);
 const Vehicle = mongoose.model('Vehicle', vehicleSchema);
 const ServiceRecord = mongoose.model('ServiceRecord', serviceRecordSchema);
+const ServiceEntry = mongoose.model('ServiceEntry', serviceEntrySchema);
 
 // In-memory OTP storage (short-lived, no need for DB)
 const otpStore: Map<string, { otp: string; expiresAt: number; phone: string; countryCode: string }> = new Map();
@@ -1299,10 +1331,207 @@ app.delete('/api/v1/service-records/:id', requireAdmin, async (req, res) => {
 });
 
 // ============================================================================
+// Service Entries (Individual service records by type)
+// ============================================================================
+
+// Create a new service entry
+app.post('/api/v1/service-entries', requireAdmin, async (req, res) => {
+  try {
+    const { vehicleId, serviceType, serviceDate, mileageAtService, data, notes, cost } = req.body;
+
+    if (!vehicleId || !serviceType) {
+      return res.status(400).json({ success: false, error: 'vehicleId and serviceType are required' });
+    }
+
+    const vehicle = await Vehicle.findById(vehicleId);
+    if (!vehicle) {
+      return res.status(404).json({ success: false, error: 'Vehicle not found' });
+    }
+
+    const entry = await ServiceEntry.create({
+      vehicleId,
+      customerId: vehicle.customerId,
+      recordedBy: (req as any).admin._id,
+      serviceType,
+      serviceDate: serviceDate || new Date(),
+      mileageAtService,
+      data,
+      notes,
+      cost,
+    });
+
+    // Update vehicle mileage if provided
+    if (mileageAtService && mileageAtService > (vehicle.mileage || 0)) {
+      await Vehicle.findByIdAndUpdate(vehicleId, { mileage: mileageAtService });
+    }
+
+    res.status(201).json({ success: true, data: entry });
+  } catch (error) {
+    console.error('Error creating service entry:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Get all service entries (with filters)
+app.get('/api/v1/service-entries', requireAdmin, async (req, res) => {
+  try {
+    const { vehicleId, customerId, serviceType, page = 1, limit = 50 } = req.query;
+
+    const filter: any = {};
+    if (vehicleId) filter.vehicleId = vehicleId;
+    if (customerId) filter.customerId = customerId;
+    if (serviceType) filter.serviceType = serviceType;
+
+    const entries = await ServiceEntry.find(filter)
+      .populate('vehicleId', 'make model year licensePlate')
+      .populate('customerId', 'firstName lastName phone')
+      .populate('recordedBy', 'firstName lastName')
+      .sort({ serviceDate: -1 })
+      .skip((Number(page) - 1) * Number(limit))
+      .limit(Number(limit));
+
+    const total = await ServiceEntry.countDocuments(filter);
+
+    res.json({
+      success: true,
+      data: entries,
+      pagination: { page: Number(page), limit: Number(limit), total, pages: Math.ceil(total / Number(limit)) },
+    });
+  } catch (error) {
+    console.error('Error fetching service entries:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Get service entries for a specific vehicle
+app.get('/api/v1/vehicles/:id/service-entries', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { serviceType } = req.query;
+
+    const filter: any = { vehicleId: id };
+    if (serviceType) filter.serviceType = serviceType;
+
+    const entries = await ServiceEntry.find(filter)
+      .populate('recordedBy', 'firstName lastName')
+      .sort({ serviceDate: -1 });
+
+    res.json({ success: true, data: entries });
+  } catch (error) {
+    console.error('Error fetching vehicle service entries:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Get a single service entry
+app.get('/api/v1/service-entries/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const entry = await ServiceEntry.findById(id)
+      .populate('vehicleId', 'make model year licensePlate')
+      .populate('customerId', 'firstName lastName phone')
+      .populate('recordedBy', 'firstName lastName');
+
+    if (!entry) {
+      return res.status(404).json({ success: false, error: 'Service entry not found' });
+    }
+
+    res.json({ success: true, data: entry });
+  } catch (error) {
+    console.error('Error fetching service entry:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Update a service entry
+app.put('/api/v1/service-entries/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { serviceDate, mileageAtService, data, notes, cost } = req.body;
+
+    const entry = await ServiceEntry.findByIdAndUpdate(
+      id,
+      { serviceDate, mileageAtService, data, notes, cost, updatedAt: new Date() },
+      { new: true }
+    );
+
+    if (!entry) {
+      return res.status(404).json({ success: false, error: 'Service entry not found' });
+    }
+
+    res.json({ success: true, data: entry });
+  } catch (error) {
+    console.error('Error updating service entry:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Delete a service entry
+app.delete('/api/v1/service-entries/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const entry = await ServiceEntry.findByIdAndDelete(id);
+
+    if (!entry) {
+      return res.status(404).json({ success: false, error: 'Service entry not found' });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error deleting service entry:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// ============================================================================
 // Mobile App - Service Data Endpoint
 // ============================================================================
 
-// Get latest service data for a vehicle (mobile app)
+// Get latest service entries for a vehicle (mobile app)
+app.get('/auth/vehicles/:id/service-entries', async (req, res) => {
+  try {
+    const auth = await getAuthenticatedUserAndCustomer(req, res);
+    if (!auth) return;
+
+    const { id } = req.params;
+    const { serviceType } = req.query;
+
+    // Verify vehicle belongs to this customer
+    const vehicle = await Vehicle.findOne({ _id: id, customerId: auth.customer._id, isActive: true });
+    if (!vehicle) {
+      return res.status(404).json({ error: 'Vehicle not found' });
+    }
+
+    const filter: any = { vehicleId: id };
+    if (serviceType) filter.serviceType = serviceType;
+
+    const entries = await ServiceEntry.find(filter).sort({ serviceDate: -1 });
+
+    // Also return the latest entry per service type for quick access
+    const latestByType: Record<string, any> = {};
+    const serviceTypes = ['oil_change', 'brake_service', 'tire_service', 'battery_service', 'fluid_service', 'filter_service'];
+
+    for (const type of serviceTypes) {
+      const latest = await ServiceEntry.findOne({ vehicleId: id, serviceType: type }).sort({ serviceDate: -1 });
+      if (latest) {
+        latestByType[type] = latest;
+      }
+    }
+
+    res.json({
+      success: true,
+      data: entries,
+      latestByType,
+    });
+  } catch (error) {
+    console.error('Error fetching service entries:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get latest service data for a vehicle (mobile app) - legacy endpoint
 app.get('/auth/vehicles/:id/service-data', async (req, res) => {
   try {
     const auth = await getAuthenticatedUserAndCustomer(req, res);
