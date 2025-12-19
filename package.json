@@ -1,47 +1,24 @@
 {
-  "name": "axleworks-backend",
+  "name": "axleworks-api",
   "version": "1.0.0",
-  "description": "AxleWorks Auto Services Backend API",
-  "main": "dist/server.js",
+  "description": "AxleWorks API Backend",
+  "main": "dist/index.js",
   "scripts": {
-    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "dev": "tsx watch src/index.ts",
     "build": "tsc",
-    "start": "node dist/server.js",
-    "seed": "ts-node scripts/seed.ts",
-    "docker:dev": "docker-compose -f docker-compose.dev.yml up --build",
-    "docker:dev:down": "docker-compose -f docker-compose.dev.yml down",
-    "docker:prod": "docker-compose up --build -d",
-    "docker:prod:down": "docker-compose down",
-    "docker:logs": "docker-compose logs -f api",
-    "docker:mongo": "docker-compose up -d mongo",
-    "docker:clean": "docker-compose down -v --rmi local"
+    "start": "node dist/index.js"
   },
-  "keywords": ["auto", "services", "obd", "vehicle", "diagnostics"],
-  "author": "AxleWorks",
-  "license": "ISC",
   "dependencies": {
-    "express": "^4.18.2",
-    "mongoose": "^8.0.0",
-    "socket.io": "^4.7.0",
-    "jsonwebtoken": "^9.0.0",
-    "bcryptjs": "^2.4.3",
-    "zod": "^3.22.0",
     "cors": "^2.8.5",
-    "helmet": "^7.1.0",
-    "morgan": "^1.10.0",
-    "multer": "^1.4.5-lts.1",
-    "dotenv": "^16.3.0",
-    "express-rate-limit": "^7.1.0"
+    "express": "^4.18.2",
+    "uuid": "^9.0.0"
   },
   "devDependencies": {
-    "typescript": "^5.3.0",
-    "@types/node": "^20.0.0",
-    "@types/express": "^4.17.21",
-    "@types/bcryptjs": "^2.4.6",
-    "@types/jsonwebtoken": "^9.0.5",
     "@types/cors": "^2.8.17",
-    "@types/morgan": "^1.9.9",
-    "@types/multer": "^1.4.11",
-    "ts-node-dev": "^2.0.0"
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.10.0",
+    "@types/uuid": "^9.0.7",
+    "tsx": "^4.6.2",
+    "typescript": "^5.3.2"
   }
 }
