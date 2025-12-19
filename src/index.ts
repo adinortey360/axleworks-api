@@ -181,9 +181,12 @@ app.post('/auth/verify-otp', async (req, res) => {
         profileComplete: user.profileComplete || false,
       },
     });
-  } catch (error) {
+  } catch (error: any) {
     console.error('Error verifying OTP:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({
+      error: 'Internal server error',
+      details: process.env.NODE_ENV !== 'production' ? error.message : undefined
+    });
   }
 });
 
@@ -605,6 +608,14 @@ async function startServer() {
     console.log('Connecting to MongoDB...');
     await mongoose.connect(MONGODB_URI);
     console.log('✅ Connected to MongoDB');
+
+    // Drop old problematic indexes
+    try {
+      await mongoose.connection.collection('users').dropIndex('email_1');
+      console.log('✅ Dropped old email index');
+    } catch (e) {
+      // Index doesn't exist, that's fine
+    }
 
     // Auto-seed admin user
     await seedAdmin();
