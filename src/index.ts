@@ -1015,6 +1015,12 @@ async function requireAdmin(req: express.Request, res: express.Response, next: e
       return res.status(401).json({ success: false, error: 'Session expired' });
     }
 
+    // Fetch and attach admin user to request
+    const admin = await AdminUser.findById(session.userId);
+    if (admin) {
+      (req as any).admin = admin;
+    }
+
     next();
   } catch (error) {
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -1351,7 +1357,7 @@ app.post('/api/v1/service-entries', requireAdmin, async (req, res) => {
     const entry = await ServiceEntry.create({
       vehicleId,
       customerId: vehicle.customerId,
-      recordedBy: (req as any).admin._id,
+      recordedBy: (req as any).admin?._id,
       serviceType,
       serviceDate: serviceDate || new Date(),
       mileageAtService,
