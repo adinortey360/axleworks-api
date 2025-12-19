@@ -446,6 +446,90 @@ app.post('/api/v1/auth/logout', async (req, res) => {
   res.json({ success: true });
 });
 
+// ============================================================================
+// Admin API - App Users Management
+// ============================================================================
+
+// Middleware to verify admin session
+async function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, error: 'No token provided' });
+  }
+
+  const token = authHeader.substring(7);
+
+  try {
+    const session = await Session.findOne({ token, userType: 'admin' });
+
+    if (!session) {
+      return res.status(401).json({ success: false, error: 'Invalid session' });
+    }
+
+    if (new Date(session.expiresAt) < new Date()) {
+      await Session.deleteOne({ token });
+      return res.status(401).json({ success: false, error: 'Session expired' });
+    }
+
+    next();
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+}
+
+// Get all app users (mobile app users)
+app.get('/api/v1/users', requireAdmin, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 10;
+    const search = req.query.search as string;
+
+    const query: any = {};
+    if (search) {
+      query.phone = { $regex: search, $options: 'i' };
+    }
+
+    const total = await User.countDocuments(query);
+    const users = await User.find(query)
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit);
+
+    res.json({
+      success: true,
+      data: users,
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit),
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching users:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Get user count for dashboard
+app.get('/api/v1/users/count', requireAdmin, async (req, res) => {
+  try {
+    const total = await User.countDocuments();
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const newToday = await User.countDocuments({ createdAt: { $gte: today } });
+
+    res.json({
+      success: true,
+      data: { total, newToday },
+    });
+  } catch (error) {
+    console.error('Error fetching user count:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
 // Connect to MongoDB and start server
 async function startServer() {
   try {
