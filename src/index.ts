@@ -399,10 +399,18 @@ async function getAuthenticatedUserAndCustomer(req: express.Request, res: expres
     return null;
   }
 
-  const customer = await Customer.findOne({ userId: user._id });
+  let customer = await Customer.findOne({ userId: user._id });
+
+  // Auto-create customer for existing users who don't have one
   if (!customer) {
-    res.status(404).json({ error: 'Customer not found' });
-    return null;
+    customer = await Customer.create({
+      userId: user._id,
+      phone: user.phone,
+      countryCode: user.countryCode,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      email: user.email,
+    });
   }
 
   return { user, customer };
