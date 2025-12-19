@@ -1513,14 +1513,14 @@ app.get('/auth/vehicles/:id/service-entries', async (req, res) => {
     const filter: any = { vehicleId: id };
     if (serviceType) filter.serviceType = serviceType;
 
-    const entries = await ServiceEntry.find(filter).sort({ serviceDate: -1 });
+    const entries = await ServiceEntry.find(filter).sort({ serviceDate: -1 }).lean();
 
     // Also return the latest entry per service type for quick access
     const latestByType: Record<string, any> = {};
     const serviceTypes = ['oil_change', 'brake_service', 'tire_service', 'battery_service', 'fluid_service', 'filter_service'];
 
     for (const type of serviceTypes) {
-      const latest = await ServiceEntry.findOne({ vehicleId: id, serviceType: type }).sort({ serviceDate: -1 });
+      const latest = await ServiceEntry.findOne({ vehicleId: id, serviceType: type }).sort({ serviceDate: -1 }).lean();
       if (latest) {
         latestByType[type] = latest;
       }
