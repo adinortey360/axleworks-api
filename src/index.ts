@@ -988,6 +988,27 @@ app.get('/api/v1/vehicles/count', requireAdmin, async (req, res) => {
   }
 });
 
+// Delete a vehicle (admin)
+app.delete('/api/v1/vehicles/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const vehicle = await Vehicle.findById(id);
+    if (!vehicle) {
+      return res.status(404).json({ success: false, error: 'Vehicle not found' });
+    }
+
+    // Soft delete
+    vehicle.isActive = false;
+    await vehicle.save();
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error deleting vehicle:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
 // Connect to MongoDB and start server
 async function startServer() {
   try {
