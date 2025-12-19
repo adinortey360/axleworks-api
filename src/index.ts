@@ -1495,6 +1495,20 @@ app.delete('/api/v1/service-entries/:id', requireAdmin, async (req, res) => {
 // Mobile App - Service Data Endpoint
 // ============================================================================
 
+// Debug: Get all brake service entries (temporary)
+app.get('/auth/debug/brake-entries', async (req, res) => {
+  try {
+    const allBrakeEntries = await ServiceEntry.find({ serviceType: 'brake_service' }).lean();
+    console.log('[DEBUG] All brake_service entries:', allBrakeEntries.length);
+    allBrakeEntries.forEach((entry: any) => {
+      console.log(`[DEBUG] - vehicleId: ${entry.vehicleId}, data:`, entry.data);
+    });
+    res.json({ count: allBrakeEntries.length, entries: allBrakeEntries });
+  } catch (error) {
+    res.status(500).json({ error: 'Error' });
+  }
+});
+
 // Get latest service entries for a vehicle (mobile app)
 app.get('/auth/vehicles/:id/service-entries', async (req, res) => {
   try {
@@ -1515,16 +1529,23 @@ app.get('/auth/vehicles/:id/service-entries', async (req, res) => {
 
     const entries = await ServiceEntry.find(filter).sort({ serviceDate: -1 }).lean();
 
+    // Debug: log all service entries for this vehicle
+    console.log(`[service-entries] Vehicle ${id} - Found ${entries.length} entries`);
+    console.log(`[service-entries] Entry types:`, entries.map((e: any) => e.serviceType));
+
     // Also return the latest entry per service type for quick access
     const latestByType: Record<string, any> = {};
     const serviceTypes = ['oil_change', 'brake_service', 'tire_service', 'battery_service', 'fluid_service', 'filter_service'];
 
     for (const type of serviceTypes) {
       const latest = await ServiceEntry.findOne({ vehicleId: id, serviceType: type }).sort({ serviceDate: -1 }).lean();
+      console.log(`[service-entries] ${type}: ${latest ? 'found' : 'not found'}`);
       if (latest) {
         latestByType[type] = latest;
       }
     }
+
+    console.log(`[service-entries] latestByType keys:`, Object.keys(latestByType));
 
     res.json({
       success: true,
