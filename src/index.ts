@@ -47,10 +47,48 @@ const refreshTokenSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
 });
 
+// Customer schema (linked to User for app users)
+const customerSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', unique: true, sparse: true },
+  firstName: { type: String },
+  lastName: { type: String },
+  phone: { type: String, required: true },
+  countryCode: { type: String },
+  email: { type: String },
+  address: { type: String },
+  city: { type: String },
+  notes: { type: String },
+  totalSpent: { type: Number, default: 0 },
+  visitCount: { type: Number, default: 0 },
+  lastVisit: { type: Date },
+  isActive: { type: Boolean, default: true },
+  createdAt: { type: Date, default: Date.now },
+});
+
+// Vehicle schema (linked to Customer)
+const vehicleSchema = new mongoose.Schema({
+  customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', required: true },
+  make: { type: String, required: true },
+  model: { type: String, required: true },
+  year: { type: Number, required: true },
+  vin: { type: String },
+  licensePlate: { type: String },
+  color: { type: String },
+  mileage: { type: Number },
+  engineType: { type: String },
+  transmission: { type: String, enum: ['automatic', 'manual', 'cvt'], default: 'automatic' },
+  fuelType: { type: String, enum: ['petrol', 'diesel', 'electric', 'hybrid'], default: 'petrol' },
+  notes: { type: String },
+  isActive: { type: Boolean, default: true },
+  createdAt: { type: Date, default: Date.now },
+});
+
 const User = mongoose.model('User', userSchema);
 const AdminUser = mongoose.model('AdminUser', adminUserSchema);
 const Session = mongoose.model('Session', sessionSchema);
 const RefreshToken = mongoose.model('RefreshToken', refreshTokenSchema);
+const Customer = mongoose.model('Customer', customerSchema);
+const Vehicle = mongoose.model('Vehicle', vehicleSchema);
 
 // In-memory OTP storage (short-lived, no need for DB)
 const otpStore: Map<string, { otp: string; expiresAt: number; phone: string; countryCode: string }> = new Map();
@@ -152,9 +190,18 @@ app.post('/auth/verify-otp', async (req, res) => {
   try {
     // Find or create user
     let user = await User.findOne({ phone, countryCode });
+    let isNewUser = false;
 
     if (!user) {
       user = await User.create({ phone, countryCode });
+      isNewUser = true;
+
+      // Create associated customer for new user
+      await Customer.create({
+        userId: user._id,
+        phone,
+        countryCode,
+      });
     }
 
     // Create session
@@ -288,6 +335,18 @@ app.put('/auth/profile', async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
+    // Also update customer data
+    if (!skipProfile) {
+      await Customer.findOneAndUpdate(
+        { userId: session.userId },
+        {
+          firstName: user.firstName,
+          lastName: user.lastName,
+          email: user.email,
+        }
+      );
+    }
+
     res.json({
       success: true,
       user: {
@@ -302,6 +361,249 @@ app.put('/auth/profile', async (req, res) => {
     });
   } catch (error) {
     console.error('Error updating profile:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================================================
+// Mobile App - Vehicle Management
+// ============================================================================
+
+// Helper: Get authenticated user and their customer
+async function getAuthenticatedUserAndCustomer(req: express.Request, res: express.Response) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'No token provided' });
+    return null;
+  }
+
+  const token = authHeader.substring(7);
+
+  const session = await Session.findOne({ token, userType: 'user' });
+
+  if (!session) {
+    res.status(401).json({ error: 'Invalid session' });
+    return null;
+  }
+
+  if (new Date(session.expiresAt) < new Date()) {
+    await Session.deleteOne({ token });
+    res.status(401).json({ error: 'Session expired' });
+    return null;
+  }
+
+  const user = await User.findById(session.userId);
+  if (!user) {
+    res.status(401).json({ error: 'User not found' });
+    return null;
+  }
+
+  const customer = await Customer.findOne({ userId: user._id });
+  if (!customer) {
+    res.status(404).json({ error: 'Customer not found' });
+    return null;
+  }
+
+  return { user, customer };
+}
+
+// Get all vehicles for authenticated user
+app.get('/auth/vehicles', async (req, res) => {
+  try {
+    const auth = await getAuthenticatedUserAndCustomer(req, res);
+    if (!auth) return;
+
+    const vehicles = await Vehicle.find({ customerId: auth.customer._id, isActive: true })
+      .sort({ createdAt: -1 });
+
+    res.json({
+      success: true,
+      vehicles: vehicles.map(v => ({
+        id: v._id,
+        make: v.make,
+        model: v.model,
+        year: v.year,
+        vin: v.vin,
+        licensePlate: v.licensePlate,
+        color: v.color,
+        mileage: v.mileage,
+        engineType: v.engineType,
+        transmission: v.transmission,
+        fuelType: v.fuelType,
+        notes: v.notes,
+        createdAt: v.createdAt,
+      })),
+    });
+  } catch (error) {
+    console.error('Error fetching vehicles:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Add a new vehicle
+app.post('/auth/vehicles', async (req, res) => {
+  try {
+    const auth = await getAuthenticatedUserAndCustomer(req, res);
+    if (!auth) return;
+
+    const { make, model, year, vin, licensePlate, color, mileage, engineType, transmission, fuelType, notes } = req.body;
+
+    if (!make || !model || !year) {
+      return res.status(400).json({ error: 'Make, model, and year are required' });
+    }
+
+    const vehicle = await Vehicle.create({
+      customerId: auth.customer._id,
+      make,
+      model,
+      year: parseInt(year),
+      vin,
+      licensePlate,
+      color,
+      mileage: mileage ? parseInt(mileage) : undefined,
+      engineType,
+      transmission: transmission || 'automatic',
+      fuelType: fuelType || 'petrol',
+      notes,
+    });
+
+    res.json({
+      success: true,
+      vehicle: {
+        id: vehicle._id,
+        make: vehicle.make,
+        model: vehicle.model,
+        year: vehicle.year,
+        vin: vehicle.vin,
+        licensePlate: vehicle.licensePlate,
+        color: vehicle.color,
+        mileage: vehicle.mileage,
+        engineType: vehicle.engineType,
+        transmission: vehicle.transmission,
+        fuelType: vehicle.fuelType,
+        notes: vehicle.notes,
+        createdAt: vehicle.createdAt,
+      },
+    });
+  } catch (error) {
+    console.error('Error creating vehicle:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update a vehicle
+app.put('/auth/vehicles/:id', async (req, res) => {
+  try {
+    const auth = await getAuthenticatedUserAndCustomer(req, res);
+    if (!auth) return;
+
+    const { id } = req.params;
+    const { make, model, year, vin, licensePlate, color, mileage, engineType, transmission, fuelType, notes } = req.body;
+
+    // Verify vehicle belongs to this customer
+    const vehicle = await Vehicle.findOne({ _id: id, customerId: auth.customer._id, isActive: true });
+    if (!vehicle) {
+      return res.status(404).json({ error: 'Vehicle not found' });
+    }
+
+    // Update fields
+    if (make) vehicle.make = make;
+    if (model) vehicle.model = model;
+    if (year) vehicle.year = parseInt(year);
+    if (vin !== undefined) vehicle.vin = vin;
+    if (licensePlate !== undefined) vehicle.licensePlate = licensePlate;
+    if (color !== undefined) vehicle.color = color;
+    if (mileage !== undefined) vehicle.mileage = parseInt(mileage);
+    if (engineType !== undefined) vehicle.engineType = engineType;
+    if (transmission) vehicle.transmission = transmission;
+    if (fuelType) vehicle.fuelType = fuelType;
+    if (notes !== undefined) vehicle.notes = notes;
+
+    await vehicle.save();
+
+    res.json({
+      success: true,
+      vehicle: {
+        id: vehicle._id,
+        make: vehicle.make,
+        model: vehicle.model,
+        year: vehicle.year,
+        vin: vehicle.vin,
+        licensePlate: vehicle.licensePlate,
+        color: vehicle.color,
+        mileage: vehicle.mileage,
+        engineType: vehicle.engineType,
+        transmission: vehicle.transmission,
+        fuelType: vehicle.fuelType,
+        notes: vehicle.notes,
+        createdAt: vehicle.createdAt,
+      },
+    });
+  } catch (error) {
+    console.error('Error updating vehicle:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete a vehicle (soft delete)
+app.delete('/auth/vehicles/:id', async (req, res) => {
+  try {
+    const auth = await getAuthenticatedUserAndCustomer(req, res);
+    if (!auth) return;
+
+    const { id } = req.params;
+
+    // Verify vehicle belongs to this customer
+    const vehicle = await Vehicle.findOne({ _id: id, customerId: auth.customer._id, isActive: true });
+    if (!vehicle) {
+      return res.status(404).json({ error: 'Vehicle not found' });
+    }
+
+    // Soft delete
+    vehicle.isActive = false;
+    await vehicle.save();
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error deleting vehicle:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get a single vehicle by ID
+app.get('/auth/vehicles/:id', async (req, res) => {
+  try {
+    const auth = await getAuthenticatedUserAndCustomer(req, res);
+    if (!auth) return;
+
+    const { id } = req.params;
+
+    const vehicle = await Vehicle.findOne({ _id: id, customerId: auth.customer._id, isActive: true });
+    if (!vehicle) {
+      return res.status(404).json({ error: 'Vehicle not found' });
+    }
+
+    res.json({
+      success: true,
+      vehicle: {
+        id: vehicle._id,
+        make: vehicle.make,
+        model: vehicle.model,
+        year: vehicle.year,
+        vin: vehicle.vin,
+        licensePlate: vehicle.licensePlate,
+        color: vehicle.color,
+        mileage: vehicle.mileage,
+        engineType: vehicle.engineType,
+        transmission: vehicle.transmission,
+        fuelType: vehicle.fuelType,
+        notes: vehicle.notes,
+        createdAt: vehicle.createdAt,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching vehicle:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
