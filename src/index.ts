@@ -96,6 +96,9 @@ const serviceRecordSchema = new mongoose.Schema({
     level: { type: String, enum: ['full', 'good', 'low', 'critical', 'not_checked'], default: 'not_checked' },
     condition: { type: String, enum: ['clean', 'good', 'dirty', 'very_dirty', 'not_checked'], default: 'not_checked' },
     changed: { type: Boolean, default: false },
+    oilType: { type: String }, // e.g., "5W-30 Synthetic", "10W-40 Conventional"
+    oilBrand: { type: String }, // e.g., "Mobil 1", "Castrol"
+    changeIntervalMonths: { type: Number, default: 6 }, // Time interval in months
     nextChangeMileage: { type: Number },
   },
 
