@@ -269,16 +269,18 @@ app.put('/auth/profile', async (req, res) => {
       return res.status(401).json({ error: 'Session expired' });
     }
 
-    const { firstName, lastName, email } = req.body;
+    const { firstName, lastName, email, skipProfile } = req.body;
+
+    const updateData: any = { profileComplete: true };
+    if (!skipProfile) {
+      if (firstName) updateData.firstName = firstName;
+      if (lastName) updateData.lastName = lastName;
+      if (email) updateData.email = email;
+    }
 
     const user = await User.findByIdAndUpdate(
       session.userId,
-      {
-        firstName,
-        lastName,
-        email,
-        profileComplete: true,
-      },
+      updateData,
       { new: true }
     );
 
