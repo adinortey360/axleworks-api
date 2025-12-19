@@ -914,6 +914,80 @@ app.get('/api/v1/users/count', requireAdmin, async (req, res) => {
   }
 });
 
+// ============================================================================
+// Admin API - Vehicles Management
+// ============================================================================
+
+// Get all vehicles (for admin panel)
+app.get('/api/v1/vehicles', requireAdmin, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 10;
+    const search = req.query.search as string;
+
+    const query: any = { isActive: true };
+    if (search) {
+      query.$or = [
+        { make: { $regex: search, $options: 'i' } },
+        { model: { $regex: search, $options: 'i' } },
+        { licensePlate: { $regex: search, $options: 'i' } },
+        { vin: { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    const total = await Vehicle.countDocuments(query);
+    const vehicles = await Vehicle.find(query)
+      .populate('customerId', 'firstName lastName phone')
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit);
+
+    res.json({
+      success: true,
+      data: vehicles.map(v => ({
+        _id: v._id,
+        make: v.make,
+        model: v.model,
+        year: v.year,
+        vin: v.vin,
+        licensePlate: v.licensePlate,
+        color: v.color,
+        mileage: v.mileage,
+        fuelType: v.fuelType,
+        transmission: v.transmission,
+        healthStatus: 'good',
+        vehicleType: v.fuelType === 'electric' ? 'Electric' : v.fuelType === 'hybrid' ? 'Hybrid' : 'Standard',
+        customer: v.customerId,
+        createdAt: v.createdAt,
+      })),
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit),
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching vehicles:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Get vehicle count for dashboard
+app.get('/api/v1/vehicles/count', requireAdmin, async (req, res) => {
+  try {
+    const total = await Vehicle.countDocuments({ isActive: true });
+
+    res.json({
+      success: true,
+      data: { total },
+    });
+  } catch (error) {
+    console.error('Error fetching vehicle count:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
 // Connect to MongoDB and start server
 async function startServer() {
   try {
