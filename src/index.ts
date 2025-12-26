@@ -417,7 +417,8 @@ async function handleWebSocketMessage(ws: WebSocket, client: WSClient, data: any
       }
 
       client.userId = session.userId.toString();
-      client.type = session.userType as 'mobile' | 'admin';
+      // Map 'user' to 'mobile' for session types (mobile app uses 'user', admin uses 'admin')
+      client.type = session.userType === 'user' ? 'mobile' : 'admin';
 
       ws.send(JSON.stringify({
         type: 'auth_success',
