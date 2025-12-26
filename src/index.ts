@@ -3,10 +3,15 @@ import cors from 'cors';
 import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
+import { createServer } from 'http';
+import { WebSocketServer, WebSocket } from 'ws';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/axleworks';
+
+// Create HTTP server for both Express and WebSocket
+const server = createServer(app);
 
 app.use(cors());
 app.use(express.json());
@@ -240,6 +245,67 @@ const serviceEntrySchema = new mongoose.Schema({
 });
 serviceEntrySchema.index({ vehicleId: 1, serviceType: 1, serviceDate: -1 });
 
+// OBD Data schema (real-time telemetry from vehicles)
+const obdDataSchema = new mongoose.Schema({
+  vehicleId: { type: mongoose.Schema.Types.ObjectId, ref: 'Vehicle', required: true },
+  customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', required: true },
+  timestamp: { type: Date, default: Date.now },
+
+  // Engine data
+  rpm: { type: Number },
+  engineLoad: { type: Number }, // percentage
+  coolantTemp: { type: Number }, // Celsius
+
+  // Performance data
+  speed: { type: Number }, // km/h
+  throttlePosition: { type: Number }, // percentage
+
+  // Fuel data
+  fuelLevel: { type: Number }, // percentage
+  shortTermFuelTrim: { type: Number },
+  longTermFuelTrim: { type: Number },
+
+  // Sensor data
+  intakeAirTemp: { type: Number }, // Celsius
+  mafAirFlow: { type: Number }, // g/s
+  manifoldPressure: { type: Number }, // kPa
+  timingAdvance: { type: Number }, // degrees
+  barometricPressure: { type: Number }, // kPa
+  ambientAirTemp: { type: Number }, // Celsius
+  catalystTemp: { type: Number }, // Celsius
+
+  // Electrical data
+  batteryVoltage: { type: Number }, // volts
+  controlModuleVoltage: { type: Number }, // volts
+
+  // Diagnostics
+  milStatus: { type: Boolean }, // check engine light
+  dtcCount: { type: Number },
+  activeDTCs: [{ type: String }],
+
+  // Calculated/derived
+  boostPressure: { type: Number }, // bar
+
+  // Connection info
+  connectionType: { type: String, enum: ['bluetooth', 'wifi', 'ble'], default: 'bluetooth' },
+  adapterType: { type: String },
+});
+obdDataSchema.index({ vehicleId: 1, timestamp: -1 });
+obdDataSchema.index({ timestamp: 1 }, { expireAfterSeconds: 86400 * 7 }); // Auto-delete after 7 days
+
+// OBD Session schema (tracks active streaming sessions)
+const obdSessionSchema = new mongoose.Schema({
+  vehicleId: { type: mongoose.Schema.Types.ObjectId, ref: 'Vehicle', required: true },
+  customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', required: true },
+  startedAt: { type: Date, default: Date.now },
+  endedAt: { type: Date },
+  isActive: { type: Boolean, default: true },
+  lastDataAt: { type: Date },
+  dataPointCount: { type: Number, default: 0 },
+  connectionType: { type: String },
+});
+obdSessionSchema.index({ vehicleId: 1, isActive: 1 });
+
 const User = mongoose.model('User', userSchema);
 const AdminUser = mongoose.model('AdminUser', adminUserSchema);
 const Session = mongoose.model('Session', sessionSchema);
@@ -248,6 +314,357 @@ const Customer = mongoose.model('Customer', customerSchema);
 const Vehicle = mongoose.model('Vehicle', vehicleSchema);
 const ServiceRecord = mongoose.model('ServiceRecord', serviceRecordSchema);
 const ServiceEntry = mongoose.model('ServiceEntry', serviceEntrySchema);
+const OBDData = mongoose.model('OBDData', obdDataSchema);
+const OBDSession = mongoose.model('OBDSession', obdSessionSchema);
+
+// ============================================================================
+// WebSocket Server Setup
+// ============================================================================
+
+const wss = new WebSocketServer({ server, path: '/ws' });
+
+// Track connected clients
+interface WSClient {
+  ws: WebSocket;
+  type: 'mobile' | 'admin';
+  userId?: string;
+  vehicleId?: string;
+  sessionId?: string;
+  subscribedVehicles: Set<string>;
+  isAlive: boolean;
+}
+
+const clients = new Map<WebSocket, WSClient>();
+
+// Store latest OBD data per vehicle (in-memory for real-time broadcasting)
+const latestOBDData = new Map<string, any>();
+
+// Heartbeat interval to detect dead connections
+const heartbeatInterval = setInterval(() => {
+  clients.forEach((client, ws) => {
+    if (!client.isAlive) {
+      console.log('[WS] Terminating dead connection');
+      clients.delete(ws);
+      return ws.terminate();
+    }
+    client.isAlive = false;
+    ws.ping();
+  });
+}, 30000);
+
+wss.on('close', () => {
+  clearInterval(heartbeatInterval);
+});
+
+wss.on('connection', (ws: WebSocket, req) => {
+  console.log('[WS] New connection from:', req.socket.remoteAddress);
+
+  const client: WSClient = {
+    ws,
+    type: 'mobile',
+    subscribedVehicles: new Set(),
+    isAlive: true,
+  };
+  clients.set(ws, client);
+
+  ws.on('pong', () => {
+    const c = clients.get(ws);
+    if (c) c.isAlive = true;
+  });
+
+  ws.on('message', async (message) => {
+    try {
+      const data = JSON.parse(message.toString());
+      await handleWebSocketMessage(ws, client, data);
+    } catch (error) {
+      console.error('[WS] Error handling message:', error);
+      ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format' }));
+    }
+  });
+
+  ws.on('close', async () => {
+    console.log('[WS] Connection closed');
+    const c = clients.get(ws);
+    if (c?.sessionId) {
+      // End OBD session
+      await OBDSession.findByIdAndUpdate(c.sessionId, {
+        endedAt: new Date(),
+        isActive: false,
+      });
+    }
+    clients.delete(ws);
+  });
+
+  ws.on('error', (error) => {
+    console.error('[WS] WebSocket error:', error);
+  });
+
+  // Send welcome message
+  ws.send(JSON.stringify({ type: 'connected', message: 'Connected to AxleWorks WebSocket' }));
+});
+
+// Handle incoming WebSocket messages
+async function handleWebSocketMessage(ws: WebSocket, client: WSClient, data: any) {
+  const { type, token, vehicleId, payload } = data;
+
+  switch (type) {
+    case 'auth': {
+      // Authenticate the connection
+      const session = await Session.findOne({ token });
+      if (!session || new Date(session.expiresAt) < new Date()) {
+        ws.send(JSON.stringify({ type: 'auth_error', message: 'Invalid or expired token' }));
+        return;
+      }
+
+      client.userId = session.userId.toString();
+      client.type = session.userType as 'mobile' | 'admin';
+
+      ws.send(JSON.stringify({
+        type: 'auth_success',
+        userType: client.type,
+        userId: client.userId,
+      }));
+      console.log(`[WS] Authenticated ${client.type} user: ${client.userId}`);
+      break;
+    }
+
+    case 'start_obd_stream': {
+      // Mobile app starting OBD data stream for a vehicle
+      if (!client.userId || client.type !== 'mobile') {
+        ws.send(JSON.stringify({ type: 'error', message: 'Not authenticated as mobile user' }));
+        return;
+      }
+
+      if (!vehicleId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'vehicleId required' }));
+        return;
+      }
+
+      // Verify vehicle belongs to user
+      const customer = await Customer.findOne({ userId: client.userId });
+      if (!customer) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Customer not found' }));
+        return;
+      }
+
+      const vehicle = await Vehicle.findOne({ _id: vehicleId, customerId: customer._id, isActive: true });
+      if (!vehicle) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Vehicle not found or not owned' }));
+        return;
+      }
+
+      // Create OBD session
+      const obdSession = await OBDSession.create({
+        vehicleId,
+        customerId: customer._id,
+        connectionType: payload?.connectionType || 'bluetooth',
+      });
+
+      client.vehicleId = vehicleId;
+      client.sessionId = obdSession._id.toString();
+
+      ws.send(JSON.stringify({
+        type: 'stream_started',
+        sessionId: client.sessionId,
+        vehicleId,
+      }));
+      console.log(`[WS] OBD stream started for vehicle: ${vehicleId}`);
+
+      // Notify admin subscribers
+      broadcastToAdminSubscribers(vehicleId, {
+        type: 'vehicle_streaming',
+        vehicleId,
+        vehicle: {
+          make: vehicle.make,
+          model: vehicle.model,
+          year: vehicle.year,
+        },
+      });
+      break;
+    }
+
+    case 'obd_data': {
+      // Mobile app sending OBD data
+      if (!client.vehicleId || !client.sessionId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'No active OBD stream' }));
+        return;
+      }
+
+      const obdPayload = payload;
+      if (!obdPayload) {
+        ws.send(JSON.stringify({ type: 'error', message: 'No OBD data in payload' }));
+        return;
+      }
+
+      // Get customer ID from session
+      const obdSession = await OBDSession.findById(client.sessionId);
+      if (!obdSession) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Session not found' }));
+        return;
+      }
+
+      // Store OBD data (sample every 2 seconds for storage, but broadcast all)
+      const now = new Date();
+      const lastStored = latestOBDData.get(client.vehicleId)?.storedAt;
+      const shouldStore = !lastStored || (now.getTime() - lastStored.getTime()) >= 2000;
+
+      if (shouldStore) {
+        await OBDData.create({
+          vehicleId: client.vehicleId,
+          customerId: obdSession.customerId,
+          timestamp: now,
+          ...obdPayload,
+        });
+
+        // Update session stats
+        await OBDSession.findByIdAndUpdate(client.sessionId, {
+          lastDataAt: now,
+          $inc: { dataPointCount: 1 },
+        });
+      }
+
+      // Store in memory for real-time access
+      latestOBDData.set(client.vehicleId, {
+        ...obdPayload,
+        timestamp: now,
+        storedAt: shouldStore ? now : lastStored,
+      });
+
+      // Broadcast to admin subscribers
+      broadcastToAdminSubscribers(client.vehicleId, {
+        type: 'obd_update',
+        vehicleId: client.vehicleId,
+        data: obdPayload,
+        timestamp: now.toISOString(),
+      });
+      break;
+    }
+
+    case 'stop_obd_stream': {
+      // Mobile app stopping OBD stream
+      if (client.sessionId) {
+        await OBDSession.findByIdAndUpdate(client.sessionId, {
+          endedAt: new Date(),
+          isActive: false,
+        });
+
+        // Notify admin subscribers
+        if (client.vehicleId) {
+          broadcastToAdminSubscribers(client.vehicleId, {
+            type: 'vehicle_stream_ended',
+            vehicleId: client.vehicleId,
+          });
+          latestOBDData.delete(client.vehicleId);
+        }
+
+        client.sessionId = undefined;
+        client.vehicleId = undefined;
+
+        ws.send(JSON.stringify({ type: 'stream_stopped' }));
+        console.log('[WS] OBD stream stopped');
+      }
+      break;
+    }
+
+    case 'subscribe_vehicle': {
+      // Admin subscribing to vehicle updates
+      if (!client.userId || client.type !== 'admin') {
+        ws.send(JSON.stringify({ type: 'error', message: 'Not authenticated as admin' }));
+        return;
+      }
+
+      if (!vehicleId) {
+        ws.send(JSON.stringify({ type: 'error', message: 'vehicleId required' }));
+        return;
+      }
+
+      client.subscribedVehicles.add(vehicleId);
+
+      // Send current data if available
+      const currentData = latestOBDData.get(vehicleId);
+      if (currentData) {
+        ws.send(JSON.stringify({
+          type: 'obd_update',
+          vehicleId,
+          data: currentData,
+          timestamp: currentData.timestamp,
+        }));
+      }
+
+      // Check if vehicle is currently streaming
+      const activeSession = await OBDSession.findOne({ vehicleId, isActive: true });
+      ws.send(JSON.stringify({
+        type: 'subscribed',
+        vehicleId,
+        isStreaming: !!activeSession,
+      }));
+      console.log(`[WS] Admin subscribed to vehicle: ${vehicleId}`);
+      break;
+    }
+
+    case 'unsubscribe_vehicle': {
+      // Admin unsubscribing from vehicle
+      if (vehicleId) {
+        client.subscribedVehicles.delete(vehicleId);
+        ws.send(JSON.stringify({ type: 'unsubscribed', vehicleId }));
+      }
+      break;
+    }
+
+    case 'subscribe_all_vehicles': {
+      // Admin subscribing to all vehicle updates
+      if (!client.userId || client.type !== 'admin') {
+        ws.send(JSON.stringify({ type: 'error', message: 'Not authenticated as admin' }));
+        return;
+      }
+
+      // Get all active streaming sessions
+      const activeSessions = await OBDSession.find({ isActive: true }).populate('vehicleId', 'make model year licensePlate');
+
+      for (const session of activeSessions) {
+        const vid = session.vehicleId._id.toString();
+        client.subscribedVehicles.add(vid);
+
+        const currentData = latestOBDData.get(vid);
+        if (currentData) {
+          ws.send(JSON.stringify({
+            type: 'obd_update',
+            vehicleId: vid,
+            vehicle: session.vehicleId,
+            data: currentData,
+            timestamp: currentData.timestamp,
+          }));
+        }
+      }
+
+      ws.send(JSON.stringify({
+        type: 'subscribed_all',
+        activeStreams: activeSessions.length,
+      }));
+      break;
+    }
+
+    case 'ping': {
+      ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+      break;
+    }
+
+    default:
+      ws.send(JSON.stringify({ type: 'error', message: `Unknown message type: ${type}` }));
+  }
+}
+
+// Broadcast to admin clients subscribed to a vehicle
+function broadcastToAdminSubscribers(vehicleId: string, message: object) {
+  const messageStr = JSON.stringify(message);
+  clients.forEach((client) => {
+    if (client.type === 'admin' && client.subscribedVehicles.has(vehicleId)) {
+      if (client.ws.readyState === WebSocket.OPEN) {
+        client.ws.send(messageStr);
+      }
+    }
+  });
+}
 
 // In-memory OTP storage (short-lived, no need for DB)
 const otpStore: Map<string, { otp: string; expiresAt: number; phone: string; countryCode: string }> = new Map();
@@ -1558,6 +1975,102 @@ app.get('/auth/vehicles/:id/service-entries', async (req, res) => {
   }
 });
 
+// ============================================================================
+// Admin API - OBD Data Endpoints
+// ============================================================================
+
+// Get OBD data history for a vehicle
+app.get('/api/v1/vehicles/:id/obd-data', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { limit = 100, since } = req.query;
+
+    const query: any = { vehicleId: id };
+    if (since) {
+      query.timestamp = { $gte: new Date(since as string) };
+    }
+
+    const data = await OBDData.find(query)
+      .sort({ timestamp: -1 })
+      .limit(Number(limit));
+
+    res.json({
+      success: true,
+      data: data.reverse(), // Chronological order
+    });
+  } catch (error) {
+    console.error('Error fetching OBD data:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Get latest OBD data for a vehicle
+app.get('/api/v1/vehicles/:id/obd-data/latest', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Check in-memory first
+    const realtime = latestOBDData.get(id);
+    if (realtime) {
+      return res.json({
+        success: true,
+        data: realtime,
+        isRealtime: true,
+      });
+    }
+
+    // Fall back to database
+    const data = await OBDData.findOne({ vehicleId: id }).sort({ timestamp: -1 });
+
+    res.json({
+      success: true,
+      data: data || null,
+      isRealtime: false,
+    });
+  } catch (error) {
+    console.error('Error fetching latest OBD data:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Get active OBD sessions
+app.get('/api/v1/obd-sessions/active', requireAdmin, async (req, res) => {
+  try {
+    const sessions = await OBDSession.find({ isActive: true })
+      .populate('vehicleId', 'make model year licensePlate')
+      .populate('customerId', 'firstName lastName phone')
+      .sort({ startedAt: -1 });
+
+    res.json({
+      success: true,
+      data: sessions,
+    });
+  } catch (error) {
+    console.error('Error fetching active OBD sessions:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Get OBD session history for a vehicle
+app.get('/api/v1/vehicles/:id/obd-sessions', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { limit = 20 } = req.query;
+
+    const sessions = await OBDSession.find({ vehicleId: id })
+      .sort({ startedAt: -1 })
+      .limit(Number(limit));
+
+    res.json({
+      success: true,
+      data: sessions,
+    });
+  } catch (error) {
+    console.error('Error fetching OBD sessions:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
 // Get latest service data for a vehicle (mobile app) - legacy endpoint
 app.get('/auth/vehicles/:id/service-data', async (req, res) => {
   try {
@@ -1631,8 +2144,9 @@ async function startServer() {
     // Auto-seed admin user
     await seedAdmin();
 
-    app.listen(PORT, () => {
+    server.listen(PORT, () => {
       console.log(`AxleWorks API running on port ${PORT}`);
+      console.log(`WebSocket server available at ws://localhost:${PORT}/ws`);
     });
   } catch (error) {
     console.error('Failed to connect to MongoDB:', error);
