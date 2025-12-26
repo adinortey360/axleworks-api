@@ -251,47 +251,72 @@ const obdDataSchema = new mongoose.Schema({
   customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', required: true },
   timestamp: { type: Date, default: Date.now },
 
-  // Engine data
+  // Engine & Performance
   rpm: { type: Number },
-  engineLoad: { type: Number }, // percentage
-  coolantTemp: { type: Number }, // Celsius
-
-  // Performance data
   speed: { type: Number }, // km/h
+  engineLoad: { type: Number }, // percentage
   throttlePosition: { type: Number }, // percentage
 
-  // Fuel data
-  fuelLevel: { type: Number }, // percentage
-  shortTermFuelTrim: { type: Number },
-  longTermFuelTrim: { type: Number },
-
-  // Sensor data
-  intakeAirTemp: { type: Number }, // Celsius
-  mafAirFlow: { type: Number }, // g/s
-  manifoldPressure: { type: Number }, // kPa
-  timingAdvance: { type: Number }, // degrees
-  barometricPressure: { type: Number }, // kPa
-  ambientAirTemp: { type: Number }, // Celsius
+  // Temperatures
+  coolantTemp: { type: Number }, // Celsius
+  engineTemp: { type: Number }, // Celsius (alias for coolant)
+  intakeTemp: { type: Number }, // Celsius
+  ambientTemp: { type: Number }, // Celsius
   catalystTemp: { type: Number }, // Celsius
 
-  // Electrical data
+  // Fuel System
+  fuelLevel: { type: Number }, // percentage
+  fuelLevelInput: { type: Number }, // percentage
+  fuelPressure: { type: Number }, // kPa
+  shortTermFuelTrim: { type: Number }, // percentage
+  longTermFuelTrim: { type: Number }, // percentage
+
+  // Air & Pressure
+  maf: { type: Number }, // g/s
+  massAirFlow: { type: Number }, // g/s (alias)
+  manifoldPressure: { type: Number }, // kPa
+  barometricPressure: { type: Number }, // kPa
+  boostPressure: { type: Number }, // bar
+
+  // Timing & Engine
+  timingAdvance: { type: Number }, // degrees
+  engineRuntime: { type: Number }, // seconds
+
+  // Electrical
   batteryVoltage: { type: Number }, // volts
   controlModuleVoltage: { type: Number }, // volts
+
+  // Throttle & Pedal
+  relativeThrottle: { type: Number }, // percentage
+  absoluteThrottleB: { type: Number }, // percentage
+  acceleratorPedalD: { type: Number }, // percentage
+  acceleratorPedalE: { type: Number }, // percentage
+  commandedThrottle: { type: Number }, // percentage
+
+  // EGR
+  commandedEGR: { type: Number }, // percentage
+  egrError: { type: Number }, // percentage
 
   // Diagnostics
   milStatus: { type: Boolean }, // check engine light
   dtcCount: { type: Number },
   activeDTCs: [{ type: String }],
 
-  // Calculated/derived
-  boostPressure: { type: Number }, // bar
+  // Distance/Maintenance
+  distanceWithMIL: { type: Number }, // km
+  distanceSinceDTCCleared: { type: Number }, // km
+  warmupsSinceDTCCleared: { type: Number },
+
+  // Advanced
+  absoluteLoad: { type: Number }, // percentage
+  commandedAirFuelRatio: { type: Number },
 
   // Connection info
   connectionType: { type: String, enum: ['bluetooth', 'wifi', 'ble'], default: 'bluetooth' },
   adapterType: { type: String },
 });
 obdDataSchema.index({ vehicleId: 1, timestamp: -1 });
-obdDataSchema.index({ timestamp: 1 }, { expireAfterSeconds: 86400 * 7 }); // Auto-delete after 7 days
+// Note: We use count-based limit (10,000 per vehicle) instead of TTL
 
 // OBD Session schema (tracks active streaming sessions)
 const obdSessionSchema = new mongoose.Schema({
@@ -504,10 +529,10 @@ async function handleWebSocketMessage(ws: WebSocket, client: WSClient, data: any
         return;
       }
 
-      // Store OBD data (sample every 2 seconds for storage, but broadcast all)
+      // Store OBD data (sample every 1 second for storage, but broadcast all)
       const now = new Date();
       const lastStored = latestOBDData.get(client.vehicleId)?.storedAt;
-      const shouldStore = !lastStored || (now.getTime() - lastStored.getTime()) >= 2000;
+      const shouldStore = !lastStored || (now.getTime() - lastStored.getTime()) >= 1000;
 
       if (shouldStore) {
         await OBDData.create({
@@ -522,13 +547,33 @@ async function handleWebSocketMessage(ws: WebSocket, client: WSClient, data: any
           lastDataAt: now,
           $inc: { dataPointCount: 1 },
         });
+
+        // Maintain 10,000 record limit per vehicle - delete oldest if exceeded
+        // Run cleanup periodically (every 100 records stored)
+        const dataCount = latestOBDData.get(client.vehicleId)?.storedCount || 0;
+        if (dataCount % 100 === 0) {
+          const count = await OBDData.countDocuments({ vehicleId: client.vehicleId });
+          if (count > 10000) {
+            // Find oldest records to delete
+            const toDelete = count - 10000;
+            const oldestRecords = await OBDData.find({ vehicleId: client.vehicleId })
+              .sort({ timestamp: 1 })
+              .limit(toDelete)
+              .select('_id');
+            const idsToDelete = oldestRecords.map(r => r._id);
+            await OBDData.deleteMany({ _id: { $in: idsToDelete } });
+            console.log(`[OBD] Cleaned up ${toDelete} old records for vehicle ${client.vehicleId}`);
+          }
+        }
       }
 
       // Store in memory for real-time access
+      const prevStoredCount = latestOBDData.get(client.vehicleId)?.storedCount || 0;
       latestOBDData.set(client.vehicleId, {
         ...obdPayload,
         timestamp: now,
         storedAt: shouldStore ? now : lastStored,
+        storedCount: shouldStore ? prevStoredCount + 1 : prevStoredCount,
       });
 
       // Broadcast to admin subscribers
@@ -1980,27 +2025,92 @@ app.get('/auth/vehicles/:id/service-entries', async (req, res) => {
 // Admin API - OBD Data Endpoints
 // ============================================================================
 
-// Get OBD data history for a vehicle
+// Get OBD data history for a vehicle (supports graphing)
 app.get('/api/v1/vehicles/:id/obd-data', requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const { limit = 100, since } = req.query;
+    const {
+      limit = 500,
+      offset = 0,
+      from,
+      to,
+      fields, // Comma-separated list of fields to return (for smaller responses)
+      downsample, // If set, return every Nth record for large datasets
+    } = req.query;
 
     const query: any = { vehicleId: id };
-    if (since) {
-      query.timestamp = { $gte: new Date(since as string) };
+
+    // Date range filtering
+    if (from || to) {
+      query.timestamp = {};
+      if (from) query.timestamp.$gte = new Date(from as string);
+      if (to) query.timestamp.$lte = new Date(to as string);
     }
 
-    const data = await OBDData.find(query)
+    // Build projection if specific fields requested
+    let projection: any = {};
+    if (fields) {
+      const fieldList = (fields as string).split(',').map(f => f.trim());
+      fieldList.forEach(f => projection[f] = 1);
+      projection.timestamp = 1; // Always include timestamp
+      projection.vehicleId = 1;
+    }
+
+    // Get total count for pagination
+    const totalCount = await OBDData.countDocuments(query);
+
+    // Fetch data
+    let dataQuery = OBDData.find(query, Object.keys(projection).length > 0 ? projection : undefined)
       .sort({ timestamp: -1 })
-      .limit(Number(limit));
+      .skip(Number(offset))
+      .limit(Math.min(Number(limit), 10000)); // Cap at 10,000
+
+    let data = await dataQuery.lean();
+
+    // Downsample if requested (take every Nth record)
+    if (downsample && Number(downsample) > 1) {
+      const n = Number(downsample);
+      data = data.filter((_, i) => i % n === 0);
+    }
 
     res.json({
       success: true,
       data: data.reverse(), // Chronological order
+      pagination: {
+        total: totalCount,
+        offset: Number(offset),
+        limit: Number(limit),
+        hasMore: totalCount > Number(offset) + data.length,
+      },
     });
   } catch (error) {
     console.error('Error fetching OBD data:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Get OBD data stats for a vehicle
+app.get('/api/v1/vehicles/:id/obd-data/stats', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const [count, oldest, newest] = await Promise.all([
+      OBDData.countDocuments({ vehicleId: id }),
+      OBDData.findOne({ vehicleId: id }).sort({ timestamp: 1 }).select('timestamp').lean(),
+      OBDData.findOne({ vehicleId: id }).sort({ timestamp: -1 }).select('timestamp').lean(),
+    ]);
+
+    res.json({
+      success: true,
+      stats: {
+        totalRecords: count,
+        oldestRecord: oldest?.timestamp || null,
+        newestRecord: newest?.timestamp || null,
+        maxRecords: 10000,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching OBD stats:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
