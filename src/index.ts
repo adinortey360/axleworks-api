@@ -2199,18 +2199,17 @@ app.get('/api/v1/vehicles/:id/obd-sessions', requireAdmin, async (req, res) => {
 // ============================================================================
 
 // Get all customers (for admin panel)
+// This queries app Users and merges with Customer data
 app.get('/api/v1/workshop/customers', requireAdmin, async (req, res) => {
   try {
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 10;
     const search = req.query.search as string;
-    const isActive = req.query.isActive as string;
 
-    const query: any = {};
-
+    // Query from User collection (app users are the source of truth)
+    const userQuery: any = {};
     if (search) {
-      // Search by name or phone
-      query.$or = [
+      userQuery.$or = [
         { firstName: { $regex: search, $options: 'i' } },
         { lastName: { $regex: search, $options: 'i' } },
         { phone: { $regex: search, $options: 'i' } },
@@ -2218,17 +2217,18 @@ app.get('/api/v1/workshop/customers', requireAdmin, async (req, res) => {
       ];
     }
 
-    if (isActive !== undefined) {
-      query.isActive = isActive === 'true';
-    }
-
-    const total = await Customer.countDocuments(query);
-    const customers = await Customer.find(query)
+    const total = await User.countDocuments(userQuery);
+    const users = await User.find(userQuery)
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
       .limit(limit);
 
-    // Get vehicle counts for each customer
+    // Get associated Customer records for these users
+    const userIds = users.map(u => u._id);
+    const customers = await Customer.find({ userId: { $in: userIds } });
+    const customerMap = new Map(customers.map(c => [c.userId?.toString(), c]));
+
+    // Get vehicle counts for customers
     const customerIds = customers.map(c => c._id);
     const vehicleCounts = await Vehicle.aggregate([
       { $match: { customerId: { $in: customerIds }, isActive: true } },
@@ -2236,28 +2236,37 @@ app.get('/api/v1/workshop/customers', requireAdmin, async (req, res) => {
     ]);
     const vehicleCountMap = new Map(vehicleCounts.map(v => [v._id.toString(), v.count]));
 
+    // Merge User data with Customer data
+    const data = users.map(u => {
+      const customer = customerMap.get(u._id.toString());
+      const vehicleCount = customer ? (vehicleCountMap.get(customer._id.toString()) || 0) : 0;
+
+      return {
+        _id: customer?._id || u._id,
+        userId: u._id,
+        firstName: u.firstName || '',
+        lastName: u.lastName || '',
+        email: u.email,
+        phone: u.phone,
+        countryCode: u.countryCode,
+        address: customer?.address,
+        notes: customer?.notes,
+        tags: customer?.tags || [],
+        source: 'app',
+        totalSpent: customer?.totalSpent || 0,
+        visitCount: customer?.visitCount || 0,
+        lastVisit: customer?.lastVisit,
+        isActive: customer?.isActive ?? true,
+        vehicles: Array(vehicleCount).fill(null),
+        profileComplete: u.profileComplete,
+        createdAt: u.createdAt,
+        updatedAt: customer?.updatedAt,
+      };
+    });
+
     res.json({
       success: true,
-      data: customers.map(c => ({
-        _id: c._id,
-        userId: c.userId,
-        firstName: c.firstName || '',
-        lastName: c.lastName || '',
-        email: c.email,
-        phone: c.phone,
-        countryCode: c.countryCode,
-        address: c.address,
-        notes: c.notes,
-        tags: c.tags,
-        source: c.source || (c.userId ? 'app' : 'walk-in'),
-        totalSpent: c.totalSpent,
-        visitCount: c.visitCount,
-        lastVisit: c.lastVisit,
-        isActive: c.isActive,
-        vehicles: Array(vehicleCountMap.get(c._id.toString()) || 0).fill(null),
-        createdAt: c.createdAt,
-        updatedAt: c.updatedAt,
-      })),
+      data,
       pagination: {
         page,
         limit,
@@ -2271,36 +2280,47 @@ app.get('/api/v1/workshop/customers', requireAdmin, async (req, res) => {
   }
 });
 
-// Get a single customer by ID
+// Get a single customer by ID (can be User ID or Customer ID)
 app.get('/api/v1/workshop/customers/:id', requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
-    const customer = await Customer.findById(id);
-    if (!customer) {
+    // First try to find User (app user)
+    let user = await User.findById(id);
+    let customer = user ? await Customer.findOne({ userId: user._id }) : await Customer.findById(id);
+
+    // If we found a customer but not a user, try to get user from customer.userId
+    if (customer && !user && customer.userId) {
+      user = await User.findById(customer.userId);
+    }
+
+    // If no user and no customer found, return 404
+    if (!user && !customer) {
       return res.status(404).json({ success: false, error: 'Customer not found' });
     }
 
+    // Build response from user (primary) + customer (additional data)
     res.json({
       success: true,
       data: {
-        _id: customer._id,
-        userId: customer.userId,
-        firstName: customer.firstName || '',
-        lastName: customer.lastName || '',
-        email: customer.email,
-        phone: customer.phone,
-        countryCode: customer.countryCode,
-        address: customer.address,
-        notes: customer.notes,
-        tags: customer.tags,
-        source: customer.source || (customer.userId ? 'app' : 'walk-in'),
-        totalSpent: customer.totalSpent,
-        visitCount: customer.visitCount,
-        lastVisit: customer.lastVisit,
-        isActive: customer.isActive,
-        createdAt: customer.createdAt,
-        updatedAt: customer.updatedAt,
+        _id: customer?._id || user?._id,
+        userId: user?._id,
+        firstName: user?.firstName || customer?.firstName || '',
+        lastName: user?.lastName || customer?.lastName || '',
+        email: user?.email || customer?.email,
+        phone: user?.phone || customer?.phone,
+        countryCode: user?.countryCode || customer?.countryCode,
+        address: customer?.address,
+        notes: customer?.notes,
+        tags: customer?.tags || [],
+        source: 'app',
+        totalSpent: customer?.totalSpent || 0,
+        visitCount: customer?.visitCount || 0,
+        lastVisit: customer?.lastVisit,
+        isActive: customer?.isActive ?? true,
+        profileComplete: user?.profileComplete,
+        createdAt: user?.createdAt || customer?.createdAt,
+        updatedAt: customer?.updatedAt,
       },
     });
   } catch (error) {
@@ -2309,12 +2329,22 @@ app.get('/api/v1/workshop/customers/:id', requireAdmin, async (req, res) => {
   }
 });
 
-// Get customer vehicles
+// Get customer vehicles (id can be User ID or Customer ID)
 app.get('/api/v1/workshop/customers/:id/vehicles', requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
-    const vehicles = await Vehicle.find({ customerId: id, isActive: true })
+    // Find customer by User ID or Customer ID
+    let customer = await Customer.findOne({ userId: id });
+    if (!customer) {
+      customer = await Customer.findById(id);
+    }
+
+    if (!customer) {
+      return res.json({ success: true, data: [] });
+    }
+
+    const vehicles = await Vehicle.find({ customerId: customer._id, isActive: true })
       .sort({ createdAt: -1 });
 
     res.json({
@@ -2341,25 +2371,26 @@ app.get('/api/v1/workshop/customers/:id/vehicles', requireAdmin, async (req, res
   }
 });
 
-// Get customer stats
+// Get customer stats (id can be User ID or Customer ID)
 app.get('/api/v1/workshop/customers/:id/stats', requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
-    const customer = await Customer.findById(id);
-    if (!customer) {
-      return res.status(404).json({ success: false, error: 'Customer not found' });
-    }
+    // Try to find user first
+    const user = await User.findById(id);
+    let customer = user ? await Customer.findOne({ userId: user._id }) : await Customer.findById(id);
 
-    const vehicleCount = await Vehicle.countDocuments({ customerId: id, isActive: true });
+    const vehicleCount = customer
+      ? await Vehicle.countDocuments({ customerId: customer._id, isActive: true })
+      : 0;
 
     res.json({
       success: true,
       data: {
-        totalSpent: customer.totalSpent,
-        visitCount: customer.visitCount,
+        totalSpent: customer?.totalSpent || 0,
+        visitCount: customer?.visitCount || 0,
         vehicleCount,
-        memberSince: customer.createdAt,
+        memberSince: user?.createdAt || customer?.createdAt,
       },
     });
   } catch (error) {
