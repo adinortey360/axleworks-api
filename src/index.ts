@@ -60,15 +60,25 @@ const customerSchema = new mongoose.Schema({
   phone: { type: String, required: true },
   countryCode: { type: String },
   email: { type: String },
-  address: { type: String },
-  city: { type: String },
+  address: {
+    street: { type: String },
+    city: { type: String },
+    state: { type: String },
+    postalCode: { type: String },
+    country: { type: String },
+  },
   notes: { type: String },
+  tags: [{ type: String }],
+  source: { type: String, enum: ['walk-in', 'app', 'referral', 'website'], default: 'app' },
   totalSpent: { type: Number, default: 0 },
   visitCount: { type: Number, default: 0 },
   lastVisit: { type: Date },
   isActive: { type: Boolean, default: true },
   createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now },
 });
+customerSchema.index({ phone: 1 });
+customerSchema.index({ firstName: 'text', lastName: 'text' });
 
 // Vehicle schema (linked to Customer)
 const vehicleSchema = new mongoose.Schema({
@@ -818,11 +828,12 @@ app.post('/auth/verify-otp', async (req, res) => {
       user = await User.create({ phone, countryCode });
       isNewUser = true;
 
-      // Create associated customer for new user
+      // Create associated customer for new user (app user)
       await Customer.create({
         userId: user._id,
         phone,
         countryCode,
+        source: 'app',
       });
     }
 
@@ -1032,6 +1043,7 @@ async function getAuthenticatedUserAndCustomer(req: express.Request, res: expres
       firstName: user.firstName,
       lastName: user.lastName,
       email: user.email,
+      source: 'app',
     });
   }
 
@@ -2178,6 +2190,295 @@ app.get('/api/v1/vehicles/:id/obd-sessions', requireAdmin, async (req, res) => {
     });
   } catch (error) {
     console.error('Error fetching OBD sessions:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// ============================================================================
+// Admin API - Workshop Customers Management
+// ============================================================================
+
+// Get all customers (for admin panel)
+app.get('/api/v1/workshop/customers', requireAdmin, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 10;
+    const search = req.query.search as string;
+    const isActive = req.query.isActive as string;
+
+    const query: any = {};
+
+    if (search) {
+      // Search by name or phone
+      query.$or = [
+        { firstName: { $regex: search, $options: 'i' } },
+        { lastName: { $regex: search, $options: 'i' } },
+        { phone: { $regex: search, $options: 'i' } },
+        { email: { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    if (isActive !== undefined) {
+      query.isActive = isActive === 'true';
+    }
+
+    const total = await Customer.countDocuments(query);
+    const customers = await Customer.find(query)
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit);
+
+    // Get vehicle counts for each customer
+    const customerIds = customers.map(c => c._id);
+    const vehicleCounts = await Vehicle.aggregate([
+      { $match: { customerId: { $in: customerIds }, isActive: true } },
+      { $group: { _id: '$customerId', count: { $sum: 1 } } },
+    ]);
+    const vehicleCountMap = new Map(vehicleCounts.map(v => [v._id.toString(), v.count]));
+
+    res.json({
+      success: true,
+      data: customers.map(c => ({
+        _id: c._id,
+        userId: c.userId,
+        firstName: c.firstName || '',
+        lastName: c.lastName || '',
+        email: c.email,
+        phone: c.phone,
+        countryCode: c.countryCode,
+        address: c.address,
+        notes: c.notes,
+        tags: c.tags,
+        source: c.source || (c.userId ? 'app' : 'walk-in'),
+        totalSpent: c.totalSpent,
+        visitCount: c.visitCount,
+        lastVisit: c.lastVisit,
+        isActive: c.isActive,
+        vehicles: Array(vehicleCountMap.get(c._id.toString()) || 0).fill(null),
+        createdAt: c.createdAt,
+        updatedAt: c.updatedAt,
+      })),
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit),
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching customers:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Get a single customer by ID
+app.get('/api/v1/workshop/customers/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const customer = await Customer.findById(id);
+    if (!customer) {
+      return res.status(404).json({ success: false, error: 'Customer not found' });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        _id: customer._id,
+        userId: customer.userId,
+        firstName: customer.firstName || '',
+        lastName: customer.lastName || '',
+        email: customer.email,
+        phone: customer.phone,
+        countryCode: customer.countryCode,
+        address: customer.address,
+        notes: customer.notes,
+        tags: customer.tags,
+        source: customer.source || (customer.userId ? 'app' : 'walk-in'),
+        totalSpent: customer.totalSpent,
+        visitCount: customer.visitCount,
+        lastVisit: customer.lastVisit,
+        isActive: customer.isActive,
+        createdAt: customer.createdAt,
+        updatedAt: customer.updatedAt,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching customer:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Get customer vehicles
+app.get('/api/v1/workshop/customers/:id/vehicles', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const vehicles = await Vehicle.find({ customerId: id, isActive: true })
+      .sort({ createdAt: -1 });
+
+    res.json({
+      success: true,
+      data: vehicles.map(v => ({
+        _id: v._id,
+        make: v.make,
+        model: v.model,
+        year: v.year,
+        vin: v.vin,
+        licensePlate: v.licensePlate,
+        color: v.color,
+        mileage: v.mileage,
+        fuelType: v.fuelType,
+        transmission: v.transmission,
+        healthStatus: 'good',
+        isActive: v.isActive,
+        createdAt: v.createdAt,
+      })),
+    });
+  } catch (error) {
+    console.error('Error fetching customer vehicles:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Get customer stats
+app.get('/api/v1/workshop/customers/:id/stats', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const customer = await Customer.findById(id);
+    if (!customer) {
+      return res.status(404).json({ success: false, error: 'Customer not found' });
+    }
+
+    const vehicleCount = await Vehicle.countDocuments({ customerId: id, isActive: true });
+
+    res.json({
+      success: true,
+      data: {
+        totalSpent: customer.totalSpent,
+        visitCount: customer.visitCount,
+        vehicleCount,
+        memberSince: customer.createdAt,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching customer stats:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Create a new customer (manual entry)
+app.post('/api/v1/workshop/customers', requireAdmin, async (req, res) => {
+  try {
+    const { firstName, lastName, phone, countryCode, email, address, notes, tags, source } = req.body;
+
+    if (!phone) {
+      return res.status(400).json({ success: false, error: 'Phone is required' });
+    }
+
+    // Check if customer with this phone already exists
+    const existing = await Customer.findOne({ phone });
+    if (existing) {
+      return res.status(400).json({ success: false, error: 'Customer with this phone already exists' });
+    }
+
+    const customer = await Customer.create({
+      firstName,
+      lastName,
+      phone,
+      countryCode,
+      email,
+      address,
+      notes,
+      tags,
+      source: source || 'walk-in',
+    });
+
+    res.status(201).json({
+      success: true,
+      data: customer,
+    });
+  } catch (error) {
+    console.error('Error creating customer:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Update a customer
+app.put('/api/v1/workshop/customers/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { firstName, lastName, email, address, notes, tags } = req.body;
+
+    const customer = await Customer.findByIdAndUpdate(
+      id,
+      {
+        firstName,
+        lastName,
+        email,
+        address,
+        notes,
+        tags,
+        updatedAt: new Date(),
+      },
+      { new: true }
+    );
+
+    if (!customer) {
+      return res.status(404).json({ success: false, error: 'Customer not found' });
+    }
+
+    res.json({
+      success: true,
+      data: customer,
+    });
+  } catch (error) {
+    console.error('Error updating customer:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Deactivate a customer
+app.post('/api/v1/workshop/customers/:id/deactivate', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const customer = await Customer.findByIdAndUpdate(
+      id,
+      { isActive: false, updatedAt: new Date() },
+      { new: true }
+    );
+
+    if (!customer) {
+      return res.status(404).json({ success: false, error: 'Customer not found' });
+    }
+
+    res.json({ success: true, data: customer });
+  } catch (error) {
+    console.error('Error deactivating customer:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Reactivate a customer
+app.post('/api/v1/workshop/customers/:id/reactivate', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const customer = await Customer.findByIdAndUpdate(
+      id,
+      { isActive: true, updatedAt: new Date() },
+      { new: true }
+    );
+
+    if (!customer) {
+      return res.status(404).json({ success: false, error: 'Customer not found' });
+    }
+
+    res.json({ success: true, data: customer });
+  } catch (error) {
+    console.error('Error reactivating customer:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
