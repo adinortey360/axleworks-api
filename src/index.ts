@@ -341,6 +341,54 @@ const obdSessionSchema = new mongoose.Schema({
 });
 obdSessionSchema.index({ vehicleId: 1, isActive: 1 });
 
+// Consultation schema (for diagnostic sessions)
+const consultationSchema = new mongoose.Schema({
+  vehicleId: { type: mongoose.Schema.Types.ObjectId, ref: 'Vehicle', required: true },
+  customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', required: true },
+  status: {
+    type: String,
+    enum: ['pending', 'locked', 'in_progress', 'completed', 'cancelled'],
+    default: 'pending',
+  },
+  // Lock info
+  lockToken: { type: String },
+  lockedAt: { type: Date },
+  lockedByDevice: { type: String },
+  // Snapshot data (captured at creation time)
+  vehicleSnapshot: {
+    make: String,
+    model: String,
+    year: Number,
+    vin: String,
+    licensePlate: String,
+    color: String,
+    mileage: Number,
+    fuelType: String,
+    transmission: String,
+  },
+  customerSnapshot: {
+    firstName: String,
+    lastName: String,
+    phone: String,
+    email: String,
+  },
+  serviceHistory: [{ type: mongoose.Schema.Types.Mixed }],
+  latestObdData: { type: mongoose.Schema.Types.Mixed },
+  // Consultation details
+  chiefComplaint: { type: String },
+  symptoms: [{ type: String }],
+  notes: { type: String },
+  diagnosis: { type: String },
+  recommendations: [{ type: String }],
+  // Timestamps
+  createdAt: { type: Date, default: Date.now },
+  startedAt: { type: Date },
+  completedAt: { type: Date },
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser' },
+});
+consultationSchema.index({ vehicleId: 1, status: 1 });
+consultationSchema.index({ status: 1, createdAt: -1 });
+
 const User = mongoose.model('User', userSchema);
 const AdminUser = mongoose.model('AdminUser', adminUserSchema);
 const Session = mongoose.model('Session', sessionSchema);
@@ -351,6 +399,7 @@ const ServiceRecord = mongoose.model('ServiceRecord', serviceRecordSchema);
 const ServiceEntry = mongoose.model('ServiceEntry', serviceEntrySchema);
 const OBDData = mongoose.model('OBDData', obdDataSchema);
 const OBDSession = mongoose.model('OBDSession', obdSessionSchema);
+const Consultation = mongoose.model('Consultation', consultationSchema);
 
 // ============================================================================
 // WebSocket Server Setup
@@ -2190,6 +2239,381 @@ app.get('/api/v1/vehicles/:id/obd-sessions', requireAdmin, async (req, res) => {
     });
   } catch (error) {
     console.error('Error fetching OBD sessions:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// ============================================================================
+// Admin API - Consultations Management
+// ============================================================================
+
+// Create a new consultation (with full vehicle snapshot)
+app.post('/api/v1/consultations', requireAdmin, async (req, res) => {
+  try {
+    const { vehicleId, chiefComplaint, symptoms } = req.body;
+
+    if (!vehicleId) {
+      return res.status(400).json({ success: false, error: 'vehicleId is required' });
+    }
+
+    // Get vehicle with customer data
+    const vehicle = await Vehicle.findById(vehicleId);
+    if (!vehicle) {
+      return res.status(404).json({ success: false, error: 'Vehicle not found' });
+    }
+
+    const customer = await Customer.findById(vehicle.customerId);
+
+    // Get service history
+    const serviceHistory = await ServiceEntry.find({ vehicleId })
+      .sort({ serviceDate: -1 })
+      .limit(20)
+      .lean();
+
+    // Get latest OBD data
+    const latestObd = await OBDData.findOne({ vehicleId })
+      .sort({ timestamp: -1 })
+      .lean();
+
+    // Create consultation with snapshots
+    const consultation = await Consultation.create({
+      vehicleId,
+      customerId: vehicle.customerId,
+      vehicleSnapshot: {
+        make: vehicle.make,
+        model: vehicle.model,
+        year: vehicle.year,
+        vin: vehicle.vin,
+        licensePlate: vehicle.licensePlate,
+        color: vehicle.color,
+        mileage: vehicle.mileage,
+        fuelType: vehicle.fuelType,
+        transmission: vehicle.transmission,
+      },
+      customerSnapshot: customer ? {
+        firstName: customer.firstName,
+        lastName: customer.lastName,
+        phone: customer.phone,
+        email: customer.email,
+      } : undefined,
+      serviceHistory,
+      latestObdData: latestObd,
+      chiefComplaint,
+      symptoms,
+      createdBy: (req as any).admin?._id,
+    });
+
+    res.status(201).json({
+      success: true,
+      data: consultation,
+    });
+  } catch (error) {
+    console.error('Error creating consultation:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Get all consultations (with filtering)
+app.get('/api/v1/consultations', requireAdmin, async (req, res) => {
+  try {
+    const { status, vehicleId, page = 1, limit = 20 } = req.query;
+
+    const filter: any = {};
+    if (status) filter.status = status;
+    if (vehicleId) filter.vehicleId = vehicleId;
+
+    const total = await Consultation.countDocuments(filter);
+    const consultations = await Consultation.find(filter)
+      .populate('vehicleId', 'make model year licensePlate')
+      .populate('customerId', 'firstName lastName phone')
+      .populate('createdBy', 'firstName lastName')
+      .sort({ createdAt: -1 })
+      .skip((Number(page) - 1) * Number(limit))
+      .limit(Number(limit));
+
+    res.json({
+      success: true,
+      data: consultations,
+      pagination: {
+        page: Number(page),
+        limit: Number(limit),
+        total,
+        pages: Math.ceil(total / Number(limit)),
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching consultations:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Get pending consultations (for desktop app to pick from)
+app.get('/api/v1/consultations/pending', async (req, res) => {
+  try {
+    const consultations = await Consultation.find({ status: 'pending' })
+      .populate('vehicleId', 'make model year licensePlate')
+      .populate('customerId', 'firstName lastName phone')
+      .sort({ createdAt: -1 });
+
+    res.json({
+      success: true,
+      data: consultations,
+    });
+  } catch (error) {
+    console.error('Error fetching pending consultations:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Get a single consultation
+app.get('/api/v1/consultations/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const consultation = await Consultation.findById(id)
+      .populate('vehicleId', 'make model year licensePlate vin mileage')
+      .populate('customerId', 'firstName lastName phone email')
+      .populate('createdBy', 'firstName lastName');
+
+    if (!consultation) {
+      return res.status(404).json({ success: false, error: 'Consultation not found' });
+    }
+
+    res.json({
+      success: true,
+      data: consultation,
+    });
+  } catch (error) {
+    console.error('Error fetching consultation:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Lock a consultation (desktop app claims it)
+app.post('/api/v1/consultations/:id/lock', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { deviceId } = req.body;
+
+    const consultation = await Consultation.findById(id);
+    if (!consultation) {
+      return res.status(404).json({ success: false, error: 'Consultation not found' });
+    }
+
+    // Check if already locked
+    if (consultation.status === 'locked' || consultation.status === 'in_progress') {
+      return res.status(409).json({
+        success: false,
+        error: 'Consultation is already locked',
+        lockedByDevice: consultation.lockedByDevice,
+      });
+    }
+
+    // Check if completed or cancelled
+    if (consultation.status === 'completed' || consultation.status === 'cancelled') {
+      return res.status(400).json({
+        success: false,
+        error: `Consultation is already ${consultation.status}`,
+      });
+    }
+
+    // Generate lock token
+    const lockToken = uuidv4();
+
+    // Lock the consultation
+    consultation.status = 'locked';
+    consultation.lockToken = lockToken;
+    consultation.lockedAt = new Date();
+    consultation.lockedByDevice = deviceId || 'unknown';
+    await consultation.save();
+
+    res.json({
+      success: true,
+      lockToken,
+      data: consultation,
+    });
+  } catch (error) {
+    console.error('Error locking consultation:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Unlock a consultation
+app.post('/api/v1/consultations/:id/unlock', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { lockToken } = req.body;
+
+    const consultation = await Consultation.findById(id);
+    if (!consultation) {
+      return res.status(404).json({ success: false, error: 'Consultation not found' });
+    }
+
+    // Verify lock token
+    if (consultation.lockToken !== lockToken) {
+      return res.status(403).json({ success: false, error: 'Invalid lock token' });
+    }
+
+    // Unlock
+    consultation.status = 'pending';
+    consultation.lockToken = undefined;
+    consultation.lockedAt = undefined;
+    consultation.lockedByDevice = undefined;
+    await consultation.save();
+
+    res.json({
+      success: true,
+      data: consultation,
+    });
+  } catch (error) {
+    console.error('Error unlocking consultation:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Start consultation (transition from locked to in_progress)
+app.post('/api/v1/consultations/:id/start', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { lockToken } = req.body;
+
+    const consultation = await Consultation.findById(id);
+    if (!consultation) {
+      return res.status(404).json({ success: false, error: 'Consultation not found' });
+    }
+
+    // Verify lock token
+    if (consultation.lockToken !== lockToken) {
+      return res.status(403).json({ success: false, error: 'Invalid lock token' });
+    }
+
+    consultation.status = 'in_progress';
+    consultation.startedAt = new Date();
+    await consultation.save();
+
+    res.json({
+      success: true,
+      data: consultation,
+    });
+  } catch (error) {
+    console.error('Error starting consultation:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Update consultation (requires lock token)
+app.put('/api/v1/consultations/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { lockToken, notes, diagnosis, recommendations, symptoms } = req.body;
+
+    const consultation = await Consultation.findById(id);
+    if (!consultation) {
+      return res.status(404).json({ success: false, error: 'Consultation not found' });
+    }
+
+    // Verify lock token for locked/in_progress consultations
+    if ((consultation.status === 'locked' || consultation.status === 'in_progress') &&
+        consultation.lockToken !== lockToken) {
+      return res.status(403).json({ success: false, error: 'Invalid lock token' });
+    }
+
+    // Update fields
+    if (notes !== undefined) consultation.notes = notes;
+    if (diagnosis !== undefined) consultation.diagnosis = diagnosis;
+    if (recommendations !== undefined) consultation.recommendations = recommendations;
+    if (symptoms !== undefined) consultation.symptoms = symptoms;
+
+    await consultation.save();
+
+    res.json({
+      success: true,
+      data: consultation,
+    });
+  } catch (error) {
+    console.error('Error updating consultation:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Complete consultation
+app.post('/api/v1/consultations/:id/complete', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { lockToken, diagnosis, recommendations, notes } = req.body;
+
+    const consultation = await Consultation.findById(id);
+    if (!consultation) {
+      return res.status(404).json({ success: false, error: 'Consultation not found' });
+    }
+
+    // Verify lock token
+    if (consultation.lockToken && consultation.lockToken !== lockToken) {
+      return res.status(403).json({ success: false, error: 'Invalid lock token' });
+    }
+
+    consultation.status = 'completed';
+    consultation.completedAt = new Date();
+    if (diagnosis) consultation.diagnosis = diagnosis;
+    if (recommendations) consultation.recommendations = recommendations;
+    if (notes) consultation.notes = notes;
+
+    // Clear lock
+    consultation.lockToken = undefined;
+
+    await consultation.save();
+
+    res.json({
+      success: true,
+      data: consultation,
+    });
+  } catch (error) {
+    console.error('Error completing consultation:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Cancel consultation
+app.post('/api/v1/consultations/:id/cancel', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const consultation = await Consultation.findById(id);
+    if (!consultation) {
+      return res.status(404).json({ success: false, error: 'Consultation not found' });
+    }
+
+    consultation.status = 'cancelled';
+    consultation.lockToken = undefined;
+    await consultation.save();
+
+    res.json({
+      success: true,
+      data: consultation,
+    });
+  } catch (error) {
+    console.error('Error cancelling consultation:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Get consultations for a vehicle
+app.get('/api/v1/vehicles/:id/consultations', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { limit = 10 } = req.query;
+
+    const consultations = await Consultation.find({ vehicleId: id })
+      .populate('createdBy', 'firstName lastName')
+      .sort({ createdAt: -1 })
+      .limit(Number(limit));
+
+    res.json({
+      success: true,
+      data: consultations,
+    });
+  } catch (error) {
+    console.error('Error fetching vehicle consultations:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
