@@ -374,9 +374,34 @@ const consultationSchema = new mongoose.Schema({
   },
   serviceHistory: [{ type: mongoose.Schema.Types.Mixed }],
   latestObdData: { type: mongoose.Schema.Types.Mixed },
-  // Consultation details
+  // Intake data
+  visitType: {
+    type: String,
+    enum: ['diagnostic', 'maintenance', 'repair_followup', 'pre_purchase', 'state_inspection', 'performance', 'electrical', 'noise_vibration', 'other'],
+    default: 'diagnostic',
+  },
+  primaryConcern: { type: String },
+  selectedSymptoms: [{ type: String }],
+  warningLights: [{ type: String }],
+  conditions: [{ type: String }],
+  onsetType: {
+    type: String,
+    enum: ['sudden', 'gradual', 'intermittent', 'unknown'],
+    default: 'unknown',
+  },
+  frequency: {
+    type: String,
+    enum: ['always', 'often', 'sometimes', 'rarely', 'once'],
+    default: 'sometimes',
+  },
+  recentAccident: { type: Boolean, default: false },
+  recentFuelUp: { type: Boolean, default: false },
+  recentRepairs: { type: String },
+  customerDescription: { type: String },
+  // Legacy fields (kept for backwards compatibility)
   chiefComplaint: { type: String },
   symptoms: [{ type: String }],
+  // Diagnosis & notes
   notes: { type: String },
   diagnosis: { type: String },
   recommendations: [{ type: String }],
@@ -2250,7 +2275,24 @@ app.get('/api/v1/vehicles/:id/obd-sessions', requireAdmin, async (req, res) => {
 // Create a new consultation (with full vehicle snapshot)
 app.post('/api/v1/consultations', requireAdmin, async (req, res) => {
   try {
-    const { vehicleId, chiefComplaint, symptoms } = req.body;
+    const {
+      vehicleId,
+      // Intake data
+      visitType,
+      primaryConcern,
+      selectedSymptoms,
+      warningLights,
+      conditions,
+      onsetType,
+      frequency,
+      recentAccident,
+      recentFuelUp,
+      recentRepairs,
+      customerDescription,
+      // Legacy fields
+      chiefComplaint,
+      symptoms,
+    } = req.body;
 
     if (!vehicleId) {
       return res.status(400).json({ success: false, error: 'vehicleId is required' });
@@ -2298,8 +2340,21 @@ app.post('/api/v1/consultations', requireAdmin, async (req, res) => {
       } : undefined,
       serviceHistory,
       latestObdData: latestObd,
-      chiefComplaint,
-      symptoms,
+      // Intake data
+      visitType: visitType || 'diagnostic',
+      primaryConcern: primaryConcern || chiefComplaint,
+      selectedSymptoms: selectedSymptoms || [],
+      warningLights: warningLights || [],
+      conditions: conditions || [],
+      onsetType: onsetType || 'unknown',
+      frequency: frequency || 'sometimes',
+      recentAccident: recentAccident || false,
+      recentFuelUp: recentFuelUp || false,
+      recentRepairs,
+      customerDescription,
+      // Legacy fields (for backwards compatibility)
+      chiefComplaint: chiefComplaint || primaryConcern,
+      symptoms: symptoms || selectedSymptoms,
       createdBy: (req as any).admin?._id,
     });
 
