@@ -3289,6 +3289,34 @@ app.post('/api/v1/workshop/customers/:id/reactivate', requireAdmin, async (req, 
   }
 });
 
+// Delete a customer
+app.delete('/api/v1/workshop/customers/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const customer = await Customer.findById(id);
+    if (!customer) {
+      return res.status(404).json({ success: false, error: 'Customer not found' });
+    }
+
+    // Delete associated vehicles
+    await Vehicle.deleteMany({ customerId: id });
+
+    // If customer has a linked user account, optionally deactivate it
+    if (customer.userId) {
+      await User.findByIdAndUpdate(customer.userId, { isActive: false });
+    }
+
+    // Delete the customer
+    await Customer.findByIdAndDelete(id);
+
+    res.json({ success: true, message: 'Customer deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting customer:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
 // Get latest service data for a vehicle (mobile app) - legacy endpoint
 app.get('/auth/vehicles/:id/service-data', async (req, res) => {
   try {
