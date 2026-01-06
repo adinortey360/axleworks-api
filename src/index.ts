@@ -3006,27 +3006,28 @@ app.get('/api/v1/workshop/customers', requireAdmin, async (req, res) => {
 
     // Format response
     const data = customers.map(c => {
-      const user = c.userId as any; // populated user
+      const doc = c.toObject() as any;
+      const user = doc.userId; // populated user
       return {
-        _id: c._id,
+        _id: doc._id,
         userId: user?._id || null,
-        firstName: c.firstName,
-        lastName: c.lastName,
-        email: c.email || user?.email || '',
-        phone: c.phone,
+        firstName: doc.firstName,
+        lastName: doc.lastName,
+        email: doc.email || user?.email || '',
+        phone: doc.phone,
         countryCode: user?.countryCode,
-        address: c.address,
-        notes: c.notes,
-        tags: c.tags || [],
-        source: user ? 'app' : (c.source || 'walk-in'),
-        totalSpent: c.totalSpent || 0,
-        visitCount: c.visitCount || 0,
-        lastVisit: c.lastVisit,
-        isActive: c.isActive ?? true,
-        vehicles: c.vehicles || [],
+        address: doc.address,
+        notes: doc.notes,
+        tags: doc.tags || [],
+        source: user ? 'app' : (doc.source || 'walk-in'),
+        totalSpent: doc.totalSpent || 0,
+        visitCount: doc.visitCount || 0,
+        lastVisit: doc.lastVisit,
+        isActive: doc.isActive ?? true,
+        vehicles: doc.vehicles || [],
         profileComplete: user?.profileComplete,
-        createdAt: c.createdAt,
-        updatedAt: c.updatedAt,
+        createdAt: doc.createdAt,
+        updatedAt: doc.updatedAt,
       };
     });
 
