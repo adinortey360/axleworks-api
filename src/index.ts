@@ -2978,68 +2978,55 @@ app.get('/api/v1/diagnostic-reports', requireAdmin, async (req, res) => {
 // ============================================================================
 
 // Get all customers (for admin panel)
-// This queries app Users and merges with Customer data
+// This queries both app Users and standalone Customers (walk-ins)
 app.get('/api/v1/workshop/customers', requireAdmin, async (req, res) => {
   try {
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 10;
     const search = req.query.search as string;
 
-    // Query from User collection (app users are the source of truth)
-    const userQuery: any = {};
-    if (search) {
-      userQuery.$or = [
+    // Build search query
+    const searchQuery = search ? {
+      $or: [
         { firstName: { $regex: search, $options: 'i' } },
         { lastName: { $regex: search, $options: 'i' } },
         { phone: { $regex: search, $options: 'i' } },
         { email: { $regex: search, $options: 'i' } },
-      ];
-    }
+      ]
+    } : {};
 
-    const total = await User.countDocuments(userQuery);
-    const users = await User.find(userQuery)
+    // Query directly from Customer collection (includes both app users and walk-ins)
+    const total = await Customer.countDocuments(searchQuery);
+    const customers = await Customer.find(searchQuery)
+      .populate('userId', 'email phone countryCode profileComplete')
+      .populate('vehicles', 'make model year licensePlate')
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
       .limit(limit);
 
-    // Get associated Customer records for these users
-    const userIds = users.map(u => u._id);
-    const customers = await Customer.find({ userId: { $in: userIds } });
-    const customerMap = new Map(customers.map(c => [c.userId?.toString(), c]));
-
-    // Get vehicle counts for customers
-    const customerIds = customers.map(c => c._id);
-    const vehicleCounts = await Vehicle.aggregate([
-      { $match: { customerId: { $in: customerIds }, isActive: true } },
-      { $group: { _id: '$customerId', count: { $sum: 1 } } },
-    ]);
-    const vehicleCountMap = new Map(vehicleCounts.map(v => [v._id.toString(), v.count]));
-
-    // Merge User data with Customer data
-    const data = users.map(u => {
-      const customer = customerMap.get(u._id.toString());
-      const vehicleCount = customer ? (vehicleCountMap.get(customer._id.toString()) || 0) : 0;
-
+    // Format response
+    const data = customers.map(c => {
+      const user = c.userId as any; // populated user
       return {
-        _id: customer?._id || u._id,
-        userId: u._id,
-        firstName: u.firstName || '',
-        lastName: u.lastName || '',
-        email: u.email,
-        phone: u.phone,
-        countryCode: u.countryCode,
-        address: customer?.address,
-        notes: customer?.notes,
-        tags: customer?.tags || [],
-        source: 'app',
-        totalSpent: customer?.totalSpent || 0,
-        visitCount: customer?.visitCount || 0,
-        lastVisit: customer?.lastVisit,
-        isActive: customer?.isActive ?? true,
-        vehicles: Array(vehicleCount).fill(null),
-        profileComplete: u.profileComplete,
-        createdAt: u.createdAt,
-        updatedAt: customer?.updatedAt,
+        _id: c._id,
+        userId: user?._id || null,
+        firstName: c.firstName,
+        lastName: c.lastName,
+        email: c.email || user?.email || '',
+        phone: c.phone,
+        countryCode: user?.countryCode,
+        address: c.address,
+        notes: c.notes,
+        tags: c.tags || [],
+        source: user ? 'app' : (c.source || 'walk-in'),
+        totalSpent: c.totalSpent || 0,
+        visitCount: c.visitCount || 0,
+        lastVisit: c.lastVisit,
+        isActive: c.isActive ?? true,
+        vehicles: c.vehicles || [],
+        profileComplete: user?.profileComplete,
+        createdAt: c.createdAt,
+        updatedAt: c.updatedAt,
       };
     });
 
