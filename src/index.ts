@@ -2999,15 +2999,23 @@ app.get('/api/v1/workshop/customers', requireAdmin, async (req, res) => {
     const total = await Customer.countDocuments(searchQuery);
     const customers = await Customer.find(searchQuery)
       .populate('userId', 'email phone countryCode profileComplete')
-      .populate('vehicles', 'make model year licensePlate')
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
       .limit(limit);
+
+    // Get vehicle counts for all customers
+    const customerIds = customers.map(c => c._id);
+    const vehicleCounts = await Vehicle.aggregate([
+      { $match: { customerId: { $in: customerIds }, isActive: true } },
+      { $group: { _id: '$customerId', count: { $sum: 1 } } },
+    ]);
+    const vehicleCountMap = new Map(vehicleCounts.map((v: any) => [v._id.toString(), v.count]));
 
     // Format response
     const data = customers.map(c => {
       const doc = c.toObject() as any;
       const user = doc.userId; // populated user
+      const vehicleCount = vehicleCountMap.get(doc._id.toString()) || 0;
       return {
         _id: doc._id,
         userId: user?._id || null,
@@ -3024,7 +3032,7 @@ app.get('/api/v1/workshop/customers', requireAdmin, async (req, res) => {
         visitCount: doc.visitCount || 0,
         lastVisit: doc.lastVisit,
         isActive: doc.isActive ?? true,
-        vehicles: doc.vehicles || [],
+        vehicles: Array(vehicleCount).fill(null), // Just for count display
         profileComplete: user?.profileComplete,
         createdAt: doc.createdAt,
         updatedAt: doc.updatedAt,
