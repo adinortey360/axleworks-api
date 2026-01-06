@@ -1812,6 +1812,68 @@ app.get('/api/v1/vehicles', requireAdmin, async (req, res) => {
   }
 });
 
+// Create a new vehicle
+app.post('/api/v1/vehicles', requireAdmin, async (req, res) => {
+  try {
+    const { customerId, make, model, year, vin, licensePlate, color, mileage, fuelType, transmission, engineSize } = req.body;
+
+    if (!customerId || !make || !model || !year) {
+      return res.status(400).json({ success: false, error: 'Customer, make, model, and year are required' });
+    }
+
+    // Verify customer exists
+    const customer = await Customer.findById(customerId);
+    if (!customer) {
+      return res.status(404).json({ success: false, error: 'Customer not found' });
+    }
+
+    // Check for duplicate VIN if provided
+    if (vin) {
+      const existingVin = await Vehicle.findOne({ vin, isActive: true });
+      if (existingVin) {
+        return res.status(400).json({ success: false, error: 'Vehicle with this VIN already exists' });
+      }
+    }
+
+    // Check for duplicate license plate if provided
+    if (licensePlate) {
+      const existingPlate = await Vehicle.findOne({ licensePlate, isActive: true });
+      if (existingPlate) {
+        return res.status(400).json({ success: false, error: 'Vehicle with this license plate already exists' });
+      }
+    }
+
+    const vehicle = await Vehicle.create({
+      customerId,
+      make,
+      model,
+      year,
+      vin,
+      licensePlate,
+      color,
+      mileage: mileage || 0,
+      fuelType: fuelType || 'gasoline',
+      transmission: transmission || 'automatic',
+      engineSize,
+      isActive: true,
+    });
+
+    // Add vehicle to customer's vehicles array
+    await Customer.findByIdAndUpdate(customerId, {
+      $push: { vehicles: vehicle._id }
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Vehicle created successfully',
+      data: vehicle,
+    });
+  } catch (error) {
+    console.error('Error creating vehicle:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
 // Get vehicle count for dashboard
 app.get('/api/v1/vehicles/count', requireAdmin, async (req, res) => {
   try {
