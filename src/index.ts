@@ -2,9 +2,15 @@ import express from 'express';
 import cors from 'cors';
 import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
+import { createHash, timingSafeEqual } from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
+import {
+  idempotencyKey,
+  mapCompletionToRecord,
+  validateCompletion,
+} from './shopProtocol';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -105,6 +111,13 @@ const serviceRecordSchema = new mongoose.Schema({
   recordedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser' },
   mileageAtService: { type: Number },
   serviceDate: { type: Date, default: Date.now },
+  // Where this record came from. Manual = back-office entry,
+  // shop = reported by a mechanic shop over the completion protocol.
+  source: { type: String, enum: ['manual', 'shop'], default: 'manual' },
+  shopName: { type: String },
+  // Idempotency key (<shop>::<shopJobId>) - resubmits return the
+  // original record instead of creating duplicates.
+  externalRef: { type: String, unique: true, sparse: true },
 
   // Oil
   oil: {
@@ -1069,6 +1082,33 @@ app.post('/auth/verify-otp', async (req, res) => {
   }
 });
 
+// Admin: list currently-live OTP codes (for manual fallback when SMS
+// delivery fails - the shop can read the code here and the customer types
+// it into the app). Expired entries are pruned on read.
+app.get('/api/v1/otps/active', requireAdmin, async (_req, res) => {
+  try {
+    const now = Date.now();
+    const otps: Array<{ phone: string; countryCode: string; otp: string; expiresInSeconds: number }> = [];
+    for (const [key, entry] of otpStore.entries()) {
+      if (entry.expiresAt <= now) {
+        otpStore.delete(key);
+        continue;
+      }
+      otps.push({
+        phone: entry.phone,
+        countryCode: entry.countryCode,
+        otp: entry.otp,
+        expiresInSeconds: Math.max(0, Math.round((entry.expiresAt - now) / 1000)),
+      });
+    }
+    otps.sort((a, b) => a.expiresInSeconds - b.expiresInSeconds);
+    res.json({ success: true, data: otps });
+  } catch (error) {
+    console.error('Error listing active OTPs:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
 // Validate session
 app.get('/auth/me', async (req, res) => {
   const authHeader = req.headers.authorization;
@@ -1946,6 +1986,99 @@ app.post('/api/v1/service-records', requireAdmin, async (req, res) => {
     });
   } catch (error) {
     console.error('Error creating service record:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// ============================================================================
+// Shop Completion Protocol - mechanic shops report finished work
+// (full contract in SHOP_PROTOCOL.md)
+// ============================================================================
+
+// Shop API keys come from the environment - no shop login UI needed:
+//   SHOP_API_KEYS="KwikFit Gh:super-secret-1,AutoGym:super-secret-2"
+// Secrets are compared by SHA-256 hash with a timing-safe equality check.
+function shopKeys(): Array<{ name: string; hash: string }> {
+  const raw = process.env.SHOP_API_KEYS ?? '';
+  const out: Array<{ name: string; hash: string }> = [];
+  for (const entry of raw.split(',')) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    const sep = trimmed.indexOf(':');
+    if (sep < 0) continue;
+    const name = trimmed.slice(0, sep).trim();
+    const secret = trimmed.slice(sep + 1);
+    if (!name || !secret) continue;
+    out.push({ name, hash: createHash('sha256').update(secret, 'utf8').digest('hex') });
+  }
+  return out;
+}
+
+function authenticateShop(req: express.Request): string | null {
+  const presented = req.header('X-Shop-Key');
+  if (!presented) return null;
+  const candidate = Buffer.from(createHash('sha256').update(presented, 'utf8').digest('hex'));
+  for (const { name, hash } of shopKeys()) {
+    const expected = Buffer.from(hash);
+    if (candidate.length === expected.length && timingSafeEqual(candidate, expected)) return name;
+  }
+  return null;
+}
+
+// Submit a completed job. Matches vehicle.vin to a registered vehicle,
+// creates one ServiceRecord from the work items, and returns the record.
+// Resubmitting the same shopJobId returns the original record (idempotent).
+app.post('/api/v1/shop/completions', async (req, res) => {
+  try {
+    const shopName = authenticateShop(req);
+    if (!shopName) {
+      return res.status(401).json({ success: false, error: 'Missing or invalid X-Shop-Key' });
+    }
+
+    const { value, errors } = validateCompletion(req.body);
+    if (!value) {
+      return res.status(400).json({ success: false, error: 'Invalid completion payload', details: errors });
+    }
+
+    const vehicle = await Vehicle.findOne({
+      vin: { $regex: `^${value.vehicle.vin.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' },
+      isActive: true,
+    });
+    if (!vehicle) {
+      return res.status(404).json({
+        success: false,
+        error: 'No registered vehicle matches this VIN',
+        vin: value.vehicle.vin,
+      });
+    }
+
+    const externalRef = idempotencyKey(shopName, value.shopJobId);
+    const existing = await ServiceRecord.findOne({ externalRef });
+    if (existing) {
+      return res.json({ success: true, duplicate: true, recordId: existing._id, vehicleId: vehicle._id });
+    }
+
+    const patch = mapCompletionToRecord(value);
+    const serviceRecord = await ServiceRecord.create({
+      vehicleId: vehicle._id,
+      customerId: vehicle.customerId,
+      source: 'shop',
+      shopName,
+      externalRef,
+      ...patch,
+    });
+
+    if (patch.mileageAtService !== undefined && patch.mileageAtService > (vehicle.mileage || 0)) {
+      vehicle.mileage = patch.mileageAtService;
+      await vehicle.save();
+    }
+
+    res.status(201).json({ success: true, duplicate: false, recordId: serviceRecord._id, vehicleId: vehicle._id });
+  } catch (error: unknown) {
+    if (typeof error === 'object' && error !== null && 'code' in error && (error as { code: number }).code === 11000) {
+      return res.status(200).json({ success: true, duplicate: true });
+    }
+    console.error('Error recording shop completion:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
@@ -3411,6 +3544,8 @@ app.get('/auth/vehicles/:id/service-data', async (req, res) => {
       serviceData: {
         serviceDate: latestRecord.serviceDate,
         mileageAtService: latestRecord.mileageAtService,
+        source: latestRecord.source ?? 'manual',
+        shopName: latestRecord.shopName ?? null,
         oil: latestRecord.oil,
         brakeFluid: latestRecord.brakeFluid,
         transmissionFluid: latestRecord.transmissionFluid,
