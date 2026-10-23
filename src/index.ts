@@ -6,6 +6,7 @@ import { createHash, timingSafeEqual } from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
+import { mapSyncToVehicleDoc, validateVehicleLink, validateVehicleSync } from './vehicleSync';
 import {
   idempotencyKey,
   mapCompletionToRecord,
@@ -88,7 +89,12 @@ customerSchema.index({ firstName: 'text', lastName: 'text' });
 
 // Vehicle schema (linked to Customer)
 const vehicleSchema = new mongoose.Schema({
-  customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', required: true },
+  // Null until the owner creates an account - the app syncs cars silently
+  // and links them on login (see POST /auth/vehicles/sync + /link).
+  customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', required: false },
+  // Client-generated idempotency key (one per car in the app).
+  clientId: { type: String, unique: true, sparse: true },
+  nickname: { type: String },
   make: { type: String, required: true },
   model: { type: String, required: true },
   year: { type: Number, required: true },
@@ -1449,6 +1455,71 @@ app.delete('/auth/vehicles/:id', async (req, res) => {
   } catch (error) {
     console.error('Error deleting vehicle:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================================================
+// Silent vehicle shadow-sync - the app is local-first and posts every car
+// here in the background (no auth). Records stay unlinked until the owner
+// logs in, at which point /auth/vehicles/link attaches them.
+// Validation/mapping live in vehicleSync.ts (pure, unit-tested).
+// ============================================================================
+
+// Register (or re-register) one car. Idempotent on clientId.
+app.post('/auth/vehicles/sync', async (req, res) => {
+  try {
+    const { value, errors } = validateVehicleSync(req.body);
+    if (!value) {
+      return res.status(400).json({ success: false, error: 'Invalid vehicle payload', details: errors });
+    }
+
+    const existing = await Vehicle.findOne({ clientId: value.clientId });
+    if (existing) {
+      return res.json({ success: true, duplicate: true, vehicleId: existing._id });
+    }
+
+    const doc = mapSyncToVehicleDoc(value);
+    const vehicle = await Vehicle.create({
+      customerId: undefined,
+      ...doc,
+    });
+    res.status(201).json({ success: true, duplicate: false, vehicleId: vehicle._id });
+  } catch (error: unknown) {
+    if (typeof error === 'object' && error !== null && 'code' in error && (error as { code: number }).code === 11000) {
+      return res.status(200).json({ success: true, duplicate: true });
+    }
+    console.error('Error syncing vehicle:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Attach the caller's unlinked cars (matched by clientId) to their account.
+app.post('/auth/vehicles/link', async (req, res) => {
+  try {
+    const auth = await getAuthenticatedUserAndCustomer(req, res);
+    if (!auth) return;
+
+    const { clientIds, errors } = validateVehicleLink(req.body);
+    if (!clientIds) {
+      return res.status(400).json({ success: false, error: 'Invalid link payload', details: errors });
+    }
+
+    const result = await Vehicle.updateMany(
+      { clientId: { $in: clientIds }, $or: [{ customerId: null }, { customerId: { $exists: false } }] },
+      { $set: { customerId: auth.customer._id } }
+    );
+    const linked = await Vehicle.find({ clientId: { $in: clientIds }, customerId: auth.customer._id })
+      .select('_id clientId')
+      .lean();
+    void result;
+    res.json({
+      success: true,
+      linkedIds: linked.map((v) => String(v._id)),
+      linkedClientIds: linked.map((v) => (v as unknown as { clientId: string }).clientId),
+    });
+  } catch (error) {
+    console.error('Error linking vehicles:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
