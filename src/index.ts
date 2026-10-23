@@ -1308,6 +1308,7 @@ app.get('/auth/vehicles', async (req, res) => {
       success: true,
       vehicles: vehicles.map(v => ({
         id: v._id,
+        clientId: v.clientId ?? null,
         make: v.make,
         model: v.model,
         year: v.year,
