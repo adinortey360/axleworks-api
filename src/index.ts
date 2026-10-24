@@ -98,7 +98,10 @@ const vehicleSchema = new mongoose.Schema({
   make: { type: String, required: true },
   model: { type: String, required: true },
   year: { type: Number, required: true },
-  vin: { type: String },
+  // VINs are globally unique per vehicle (ISO 3779) - the database
+  // enforces it so the same car can never exist twice. Sparse because
+  // manual-entry cars may legitimately have no VIN.
+  vin: { type: String, unique: true, sparse: true },
   licensePlate: { type: String },
   color: { type: String },
   mileage: { type: Number },
@@ -1477,6 +1480,17 @@ app.post('/auth/vehicles/sync', async (req, res) => {
     const existing = await Vehicle.findOne({ clientId: value.clientId });
     if (existing) {
       return res.json({ success: true, duplicate: true, vehicleId: existing._id });
+    }
+
+    // A different clientId reporting an already-registered VIN is the same
+    // physical car - return the existing record instead of duplicating it.
+    if (value.vin) {
+      const byVin = await Vehicle.findOne({
+        vin: { $regex: `^${value.vin.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' },
+      });
+      if (byVin) {
+        return res.json({ success: true, duplicate: true, vehicleId: byVin._id });
+      }
     }
 
     const doc = mapSyncToVehicleDoc(value);
