@@ -252,7 +252,9 @@ const serviceRecordSchema = new mongoose.Schema({
 // Service Entry schema (individual service records with type-specific data)
 const serviceEntrySchema = new mongoose.Schema({
   vehicleId: { type: mongoose.Schema.Types.ObjectId, ref: 'Vehicle', required: true },
-  customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', required: true },
+  // Optional for the same reason as service records: unlinked shop/test
+  // vehicles must still be serviceable; the link fills in when one exists.
+  customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', required: false },
   recordedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser' },
   serviceType: {
     type: String,
@@ -2191,7 +2193,8 @@ app.get('/api/v1/service-records', requireAdmin, async (req, res) => {
     const records = await ServiceRecord.find(query)
       .populate('vehicleId', 'make model year licensePlate')
       .populate('customerId', 'firstName lastName phone')
-      .sort({ serviceDate: -1 })
+      // createdAt breaks ties: several quick services can share a date.
+      .sort({ serviceDate: -1, createdAt: -1 })
       .skip((page - 1) * limit)
       .limit(limit);
 
@@ -2217,7 +2220,7 @@ app.get('/api/v1/vehicles/:id/service-records', requireAdmin, async (req, res) =
     const { id } = req.params;
 
     const records = await ServiceRecord.find({ vehicleId: id })
-      .sort({ serviceDate: -1 })
+      .sort({ serviceDate: -1, createdAt: -1 })
       .limit(20);
 
     res.json({
@@ -2317,7 +2320,7 @@ app.post('/api/v1/service-entries', requireAdmin, async (req, res) => {
 
     const entry = await ServiceEntry.create({
       vehicleId,
-      customerId: vehicle.customerId,
+      ...(vehicle.customerId ? { customerId: vehicle.customerId } : {}),
       recordedBy: (req as any).admin?._id,
       serviceType,
       serviceDate: serviceDate || new Date(),
@@ -2335,6 +2338,9 @@ app.post('/api/v1/service-entries', requireAdmin, async (req, res) => {
     res.status(201).json({ success: true, data: entry });
   } catch (error) {
     console.error('Error creating service entry:', error);
+    if (error instanceof Error && error.name === 'ValidationError') {
+      return res.status(400).json({ success: false, error: error.message });
+    }
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
@@ -2499,7 +2505,7 @@ app.get('/auth/vehicles/:id/service-entries', async (req, res) => {
     const serviceTypes = ['oil_change', 'brake_service', 'tire_service', 'battery_service', 'fluid_service', 'filter_service'];
 
     for (const type of serviceTypes) {
-      const latest = await ServiceEntry.findOne({ vehicleId: id, serviceType: type }).sort({ serviceDate: -1 }).lean();
+      const latest = await ServiceEntry.findOne({ vehicleId: id, serviceType: type }).sort({ serviceDate: -1, createdAt: -1 }).lean();
       console.log(`[service-entries] ${type}: ${latest ? 'found' : 'not found'}`);
       if (latest) {
         latestByType[type] = latest;
@@ -3618,17 +3624,36 @@ app.get('/auth/vehicles/:id/service-data', async (req, res) => {
       return res.status(404).json({ error: 'Vehicle not found' });
     }
 
-    // Get the latest service record
-    const latestRecord = await ServiceRecord.findOne({ vehicleId: id })
-      .sort({ serviceDate: -1 });
+    // Get recent records, newest first. Fluids are merged per-fluid below:
+    // each quick service only touches its own fluid, so taking the whole
+    // latest record would erase yesterday's oil change the moment brakes
+    // get logged today. Point-in-time sections stay on the newest record.
+    // .lean() so per-fluid merging below works on plain objects.
+    const records = await ServiceRecord.find({ vehicleId: id })
+      .sort({ serviceDate: -1, createdAt: -1 })
+      .limit(25)
+      .lean();
 
-    if (!latestRecord) {
+    if (records.length === 0) {
       return res.json({
         success: true,
         hasServiceData: false,
         serviceData: null,
       });
     }
+
+    const latestRecord: any = records[0];
+    const hasFluidData = (f: any): boolean =>
+      !!f && (f.changed === true || (typeof f.level === 'string' && f.level !== 'not_checked') ||
+        (typeof f.condition === 'string' && f.condition !== 'not_checked'));
+    const latestFluidFor = (key: string): any => {
+      const found = records.find((r: any) => hasFluidData((r as any)[key]));
+      return (found as any)?.[key] ?? (latestRecord as any)[key];
+    };
+    const latestOil: any = latestFluidFor('oil') || {};
+    const nextChangeRecord = records.find(
+      (r: any) => r?.oil && typeof r.oil.nextChangeMileage === 'number'
+    ) as any;
 
     res.json({
       success: true,
@@ -3638,11 +3663,13 @@ app.get('/auth/vehicles/:id/service-data', async (req, res) => {
         mileageAtService: latestRecord.mileageAtService,
         source: latestRecord.source ?? 'manual',
         shopName: latestRecord.shopName ?? null,
-        oil: latestRecord.oil,
-        brakeFluid: latestRecord.brakeFluid,
-        transmissionFluid: latestRecord.transmissionFluid,
-        coolant: latestRecord.coolant,
-        powerSteeringFluid: latestRecord.powerSteeringFluid,
+        oil: nextChangeRecord
+          ? { ...latestOil, nextChangeMileage: nextChangeRecord.oil.nextChangeMileage }
+          : latestOil,
+        brakeFluid: latestFluidFor('brakeFluid'),
+        transmissionFluid: latestFluidFor('transmissionFluid'),
+        coolant: latestFluidFor('coolant'),
+        powerSteeringFluid: latestFluidFor('powerSteeringFluid'),
         brakePads: latestRecord.brakePads,
         tires: latestRecord.tires,
         battery: latestRecord.battery,
