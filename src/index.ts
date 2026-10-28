@@ -116,7 +116,10 @@ const vehicleSchema = new mongoose.Schema({
 // Service Record schema (maintenance data recorded during service visits)
 const serviceRecordSchema = new mongoose.Schema({
   vehicleId: { type: mongoose.Schema.Types.ObjectId, ref: 'Vehicle', required: true },
-  customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', required: true },
+  // Optional: shop/test vehicles may not be linked to a customer yet.
+  // Records are always queryable by vehicleId; the link fills in on write
+  // when the vehicle has one.
+  customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', required: false },
   recordedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser' },
   mileageAtService: { type: Number },
   serviceDate: { type: Date, default: Date.now },
@@ -2056,7 +2059,7 @@ app.post('/api/v1/service-records', requireAdmin, async (req, res) => {
 
     const serviceRecord = await ServiceRecord.create({
       vehicleId,
-      customerId: vehicle.customerId,
+      ...(vehicle.customerId ? { customerId: vehicle.customerId } : {}),
       ...recordData,
     });
 
@@ -2072,6 +2075,9 @@ app.post('/api/v1/service-records', requireAdmin, async (req, res) => {
     });
   } catch (error) {
     console.error('Error creating service record:', error);
+    if (error instanceof Error && error.name === 'ValidationError') {
+      return res.status(400).json({ success: false, error: error.message });
+    }
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
