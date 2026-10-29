@@ -169,6 +169,12 @@ const serviceRecordSchema = new mongoose.Schema({
     changed: { type: Boolean, default: false },
   },
 
+  // Washer Fluid (no OBD level PID exists anywhere - service records only)
+  washerFluid: {
+    level: { type: String, enum: ['full', 'good', 'low', 'critical', 'not_checked'], default: 'not_checked' },
+    changed: { type: Boolean, default: false },
+  },
+
   // Brake Pads
   brakePads: {
     frontLeft: { type: Number, min: 0, max: 100 }, // percentage remaining
@@ -3646,9 +3652,19 @@ app.get('/auth/vehicles/:id/service-data', async (req, res) => {
     const hasFluidData = (f: any): boolean =>
       !!f && (f.changed === true || (typeof f.level === 'string' && f.level !== 'not_checked') ||
         (typeof f.condition === 'string' && f.condition !== 'not_checked'));
+    // Newest record carrying real data for a fluid, with the provenance
+    // (service date + mileage) attached so clients can compute per-fluid
+    // due mileage. Null when no record has real data for the fluid.
     const latestFluidFor = (key: string): any => {
-      const found = records.find((r: any) => hasFluidData((r as any)[key]));
-      return (found as any)?.[key] ?? (latestRecord as any)[key];
+      const found = records.find((r: any) => hasFluidData(r[key]));
+      const base = ((found ?? latestRecord) as any)?.[key] ?? null;
+      if (!base) return null;
+      const src = found ?? latestRecord;
+      return {
+        ...base,
+        servicedAt: src.serviceDate ?? null,
+        servicedMileage: typeof src.mileageAtService === 'number' ? src.mileageAtService : null,
+      };
     };
     const latestOil: any = latestFluidFor('oil') || {};
     const nextChangeRecord = records.find(
@@ -3670,6 +3686,7 @@ app.get('/auth/vehicles/:id/service-data', async (req, res) => {
         transmissionFluid: latestFluidFor('transmissionFluid'),
         coolant: latestFluidFor('coolant'),
         powerSteeringFluid: latestFluidFor('powerSteeringFluid'),
+        washerFluid: latestFluidFor('washerFluid'),
         brakePads: latestRecord.brakePads,
         tires: latestRecord.tires,
         battery: latestRecord.battery,
