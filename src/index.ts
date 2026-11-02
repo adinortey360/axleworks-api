@@ -6,6 +6,7 @@ import { createHash, timingSafeEqual } from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
+import { attachRemoteBridge, RemoteCommand } from './remoteBridge';
 import { mapSyncToVehicleDoc, validateVehicleLink, validateVehicleSync } from './vehicleSync';
 import {
   idempotencyKey,
@@ -3723,9 +3724,62 @@ async function startServer() {
     // Auto-seed admin user
     await seedAdmin();
 
+    // Remote bridge: live internet relay for friend cars (see remoteBridge.ts).
+    // Phones hold /ws/remote-car, admin consoles hold /ws/remote-console.
+    // Coexists with the live-OBD /ws channel (distinct paths).
+    const remoteBridge = attachRemoteBridge(server, {
+      findSession: async (token: string) => {
+        if (!token) return null;
+        const session = await Session.findOne({ token });
+        if (!session) return null;
+        if (new Date(session.expiresAt) < new Date()) {
+          await Session.deleteOne({ token });
+          return null;
+        }
+        let label: string | undefined;
+        try {
+          if (session.userType === 'admin') {
+            const admin = await AdminUser.findById(session.userId);
+            label = admin?.email;
+          } else {
+            const user = await User.findById(session.userId);
+            label = user ? `${user.countryCode ?? ''}${user.phone ?? ''}` : undefined;
+          }
+        } catch {
+          // label is best-effort
+        }
+        return { userId: String(session.userId), userType: session.userType, label };
+      },
+    });
+
+    // Admin: cars currently sharing a live remote session.
+    app.get('/api/v1/remote/sessions', requireAdmin, async (_req, res) => {
+      try {
+        res.json({ success: true, data: remoteBridge.listSessions() });
+      } catch (error) {
+        console.error('Error listing remote sessions:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+      }
+    });
+
+    // Admin: audit trail of remote commands (newest first).
+    app.get('/api/v1/remote/audit', requireAdmin, async (req, res) => {
+      try {
+        const limit = Math.min(parseInt(String(req.query.limit ?? '100'), 10) || 100, 500);
+        const filter: Record<string, unknown> = {};
+        if (req.query.sessionId) filter.sessionId = String(req.query.sessionId);
+        const rows = await RemoteCommand.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
+        res.json({ success: true, data: rows });
+      } catch (error) {
+        console.error('Error reading remote audit:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+      }
+    });
+
     server.listen(PORT, () => {
       console.log(`AxleWorks API running on port ${PORT}`);
       console.log(`WebSocket server available at ws://localhost:${PORT}/ws`);
+      console.log(`Remote bridge available at ws://localhost:${PORT}/ws/remote-car + /ws/remote-console`);
     });
   } catch (error) {
     console.error('Failed to connect to MongoDB:', error);
