@@ -589,7 +589,22 @@ const DiagnosticReport = mongoose.model('DiagnosticReport', diagnosticReportSche
 // WebSocket Server Setup
 // ============================================================================
 
-const wss = new WebSocketServer({ server, path: '/ws' });
+// noServer + manual routing: the path-bound form 400-aborts every other
+// upgrade on this server (including /ws/remote-* below), so routing is
+// explicit and non-matching paths are left alone for other handlers.
+const wss = new WebSocketServer({ noServer: true });
+server.on('upgrade', (req, socket, head) => {
+  let pathname = '';
+  try {
+    pathname = new URL(req.url ?? '', 'http://localhost').pathname;
+  } catch {
+    return;
+  }
+  if (pathname !== '/ws') return;
+  wss.handleUpgrade(req, socket as any, head, (ws: WebSocket) => {
+    wss.emit('connection', ws, req);
+  });
+});
 
 // Track connected clients
 interface WSClient {
