@@ -38,6 +38,18 @@ const ALLOWED_SERVICES = new Set(['01', '02', '03', '05', '06', '07', '09', '0A'
 /** AT commands a remote console may issue (headers/filters/probing only). */
 const ALLOWED_AT = /^(SH|CRA|AR|DPN?|RV|E[01]|L[01]|S[01]|H[01]|SP|ST|AT[012]|Z|D|PC|WS|I|@1|DPN)\b/i;
 
+/** Extra AT setup needed for raw UDS work (flow control, headers). */
+const RAW_EXTRA_AT = /^(FC|IFR|KW|MP)\b/i;
+
+/**
+ * Services that stay blocked even in raw mode. 04 wipes the very evidence
+ * being collected remotely; 08 drives actuators on someone else's car.
+ */
+const ALWAYS_BLOCKED_SERVICES = new Set(['04', '08']);
+
+/** Raw CAN window: admin toggles it per session, auto-expires. */
+export const RAW_WINDOW_MS = 15 * 60 * 1000;
+
 export interface SafetyVerdict {
   allowed: boolean;
   reason?: string;
@@ -45,14 +57,19 @@ export interface SafetyVerdict {
 
 /**
  * Decide whether a raw ELM command line may be executed on someone else's
- * car. Default-deny: unknown shapes are blocked, never passed.
+ * car. Default-deny: unknown shapes are blocked, never passed through.
+ * With raw mode on, any service goes through except 04/08, and monitor
+ * modes (MA/MR/MT) stay blocked - a stream would wedge the request/reply
+ * protocol the relay depends on.
  */
-export function remoteCommandAllowed(rawCmd: string): SafetyVerdict {
+export function remoteCommandAllowed(rawCmd: string, rawMode = false): SafetyVerdict {
   const cmd = rawCmd.trim().toUpperCase();
   if (!cmd) return { allowed: false, reason: 'empty command' };
   if (cmd.startsWith('AT')) {
     const at = cmd.slice(2).trim();
     if (ALLOWED_AT.test(at)) return { allowed: true };
+    if (rawMode && RAW_EXTRA_AT.test(at)) return { allowed: true, reason: 'raw' };
+    if (/^(MA|MR|MT)\b/.test(at)) return { allowed: false, reason: 'monitor mode is blocked remotely (streams wedge the relay)' };
     return { allowed: false, reason: `AT command not allowed remotely: ${at.split(/\s/)[0] || 'AT'}` };
   }
   // Service byte = first two hex digits (spaces stripped first, so '22 1940'
@@ -61,9 +78,13 @@ export function remoteCommandAllowed(rawCmd: string): SafetyVerdict {
   const m = /^([0-9A-F]{2})(?=[0-9A-F]|$)/.exec(flat);
   const svc = m?.[1];
   if (!svc) return { allowed: false, reason: 'not a recognised ELM request' };
+  if (ALWAYS_BLOCKED_SERVICES.has(svc)) {
+    return svc === '04'
+      ? { allowed: false, reason: 'Mode 04 (clear DTCs) is blocked on remote sessions' }
+      : { allowed: false, reason: 'Mode 08 (actuator control) is blocked on remote sessions' };
+  }
   if (ALLOWED_SERVICES.has(svc)) return { allowed: true };
-  if (svc === '04') return { allowed: false, reason: 'Mode 04 (clear DTCs) is blocked on remote sessions' };
-  if (svc === '08') return { allowed: false, reason: 'Mode 08 (actuator control) is blocked on remote sessions' };
+  if (rawMode) return { allowed: true, reason: 'raw' };
   return { allowed: false, reason: `service ${svc} is not readable remotely` };
 }
 
@@ -83,6 +104,7 @@ const remoteCommandSchema = new mongoose.Schema({
   adminEmail: { type: String },
   cmd: { type: String, required: true },
   allowed: { type: Boolean, required: true },
+  raw: { type: Boolean },
   blockReason: { type: String },
   ok: { type: Boolean },
   latencyMs: { type: Number },
@@ -112,6 +134,8 @@ export interface RemoteSessionInfo {
   ownerPhone?: string;
   connectedAt: string;
   lastSeenAt: string;
+  /** Raw CAN mode active until this timestamp (ms), or omitted. */
+  rawUntil?: number;
 }
 
 interface CarSocket {
@@ -123,6 +147,9 @@ interface CarSocket {
   connectedAt: number;
   lastSeenAt: number;
   pending: Map<string, { resolve: (v: any) => void; timer: ReturnType<typeof setTimeout> }>;
+  /** Raw CAN window expiry (ms epoch). Absent/expired = read-only mode. */
+  rawUntil: number | null;
+  rawTimer: ReturnType<typeof setTimeout> | null;
 }
 
 interface ConsoleSocket {
@@ -160,13 +187,48 @@ export function attachRemoteBridge(server: HttpServer, deps: RemoteBridgeDeps): 
   };
 
   function listSessions(): RemoteSessionInfo[] {
+    const now = Date.now();
     return [...cars.values()].map((c) => ({
       sessionId: c.sessionId,
       vehicle: c.vehicle,
       ownerPhone: c.ownerPhone,
       connectedAt: new Date(c.connectedAt).toISOString(),
       lastSeenAt: new Date(c.lastSeenAt).toISOString(),
+      ...(c.rawUntil && c.rawUntil > now ? { rawUntil: c.rawUntil } : {}),
     }));
+  }
+
+  /** Flip raw CAN mode for a session (admin only, call-site checked). */
+  function setRawMode(car: CarSocket, on: boolean, adminId?: string, adminEmail?: string): void {
+    if (car.rawTimer) {
+      clearTimeout(car.rawTimer);
+      car.rawTimer = null;
+    }
+    car.rawUntil = on ? Date.now() + RAW_WINDOW_MS : null;
+    if (on) {
+      car.rawTimer = setTimeout(() => {
+        car.rawUntil = null;
+        car.rawTimer = null;
+        send(car.ws, { type: 'raw', on: false, reason: 'window expired' });
+        broadcastSessions();
+      }, RAW_WINDOW_MS + 1000);
+    }
+    send(car.ws, { type: 'raw', on, until: car.rawUntil ?? undefined });
+    broadcastSessions();
+    void audit({
+      sessionId: car.sessionId,
+      vehicleClientId: car.vehicle.clientId,
+      make: car.vehicle.make,
+      model: car.vehicle.model,
+      year: car.vehicle.year,
+      vin: car.vehicle.vin,
+      ownerPhone: car.ownerPhone,
+      adminId,
+      adminEmail,
+      cmd: on ? 'RAW-MODE ON (15 min)' : 'RAW-MODE OFF',
+      allowed: true,
+    });
+    console.log(`[remote-bridge] raw mode ${on ? 'ON' : 'OFF'} for ${car.sessionId}`);
   }
 
   async function audit(entry: Record<string, unknown>): Promise<void> {
@@ -234,12 +296,14 @@ export function attachRemoteBridge(server: HttpServer, deps: RemoteBridgeDeps): 
             year: msg.vehicle?.year,
             vin: msg.vehicle?.vin,
           },
-          ownerPhone: session.label,
-          ownerUserId: session.userId,
-          connectedAt: Date.now(),
-          lastSeenAt: Date.now(),
-          pending: new Map(),
-        };
+        ownerPhone: session.label,
+        ownerUserId: session.userId,
+        connectedAt: Date.now(),
+        lastSeenAt: Date.now(),
+        pending: new Map(),
+        rawUntil: null,
+        rawTimer: null,
+      };
         cars.set(sessionId, car);
         send(ws, { type: 'welcome', sessionId });
         broadcastSessions();
@@ -265,6 +329,7 @@ export function attachRemoteBridge(server: HttpServer, deps: RemoteBridgeDeps): 
     const drop = (): void => {
       if (car) {
         cars.delete(car.sessionId);
+        if (car.rawTimer) clearTimeout(car.rawTimer);
         for (const p of car.pending.values()) {
           clearTimeout(p.timer);
           p.resolve({ type: 'result', id: null, ok: false, error: 'car disconnected' });
@@ -313,6 +378,21 @@ export function attachRemoteBridge(server: HttpServer, deps: RemoteBridgeDeps): 
         return;
       }
 
+      if (msg?.type === 'raw') {
+        if (msg.on !== true && msg.on !== false) {
+          send(ws, { type: 'result', id: msg.id ?? null, ok: false, error: 'raw toggle needs "on": true/false' });
+          return;
+        }
+        const car = cars.get(String(msg.sessionId || ''));
+        if (!car || car.ws.readyState !== WebSocket.OPEN) {
+          send(ws, { type: 'result', id: msg.id ?? null, ok: false, error: 'car is no longer online' });
+          return;
+        }
+        setRawMode(car, msg.on, con?.adminId, con?.adminEmail);
+        send(ws, { type: 'result', id: msg.id ?? null, ok: true, raw: msg.on });
+        return;
+      }
+
       if (msg?.type === 'exec') {
         const started = Date.now();
         const cmd = String(msg.cmd || '');
@@ -334,7 +414,8 @@ export function attachRemoteBridge(server: HttpServer, deps: RemoteBridgeDeps): 
           await audit({ ...baseAudit, allowed: true, ok: false, error: 'car offline at exec' });
           return;
         }
-        const verdict = remoteCommandAllowed(cmd);
+        const rawActive = !!car.rawUntil && car.rawUntil > Date.now();
+        const verdict = remoteCommandAllowed(cmd, rawActive);
         if (!verdict.allowed) {
           send(ws, { type: 'result', id: msg.id ?? null, ok: false, error: `blocked: ${verdict.reason}` });
           await audit({ ...baseAudit, allowed: false, blockReason: verdict.reason, ok: false });
@@ -359,6 +440,7 @@ export function attachRemoteBridge(server: HttpServer, deps: RemoteBridgeDeps): 
         await audit({
           ...baseAudit,
           allowed: true,
+          raw: rawActive || undefined,
           ok: !!outcome.ok,
           latencyMs,
           error: outcome.ok ? undefined : outcome.error,

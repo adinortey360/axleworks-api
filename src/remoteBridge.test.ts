@@ -26,8 +26,17 @@ check('AT CRA allowed', remoteCommandAllowed('AT CRA 641').allowed);
 check('ATRV allowed', remoteCommandAllowed('ATRV').allowed);
 check('ATZ allowed', remoteCommandAllowed('ATZ').allowed);
 check('mode 04 blocked', !remoteCommandAllowed('04').allowed);
-check('mode 08 blocked', !remoteCommandAllowed('22 1940;04').allowed === false || !remoteCommandAllowed('08 00').allowed);
+check('mode 08 blocked', !remoteCommandAllowed('08 00').allowed);
 check('MA monitor blocked', !remoteCommandAllowed('AT MA').allowed);
+check('UDS service blocked by default', !remoteCommandAllowed('10 03').allowed);
+check('UDS tester-present blocked by default', !remoteCommandAllowed('3E 00').allowed);
+check('FC blocked by default', !remoteCommandAllowed('AT FC SH 7E2').allowed);
+check('raw mode allows UDS service', remoteCommandAllowed('10 03', true).allowed);
+check('raw mode allows tester present', remoteCommandAllowed('3E 00', true).allowed);
+check('raw mode allows FC setup', remoteCommandAllowed('AT FC SH 7E2', true).allowed);
+check('raw mode still blocks 04', !remoteCommandAllowed('04', true).allowed);
+check('raw mode still blocks 08', !remoteCommandAllowed('08 00', true).allowed);
+check('raw mode still blocks MA', !remoteCommandAllowed('AT MA', true).allowed);
 check('MR blocked', !remoteCommandAllowed('AT MR 7E8').allowed);
 check('garbage blocked', !remoteCommandAllowed('HELLO CAR').allowed);
 check('empty blocked', !remoteCommandAllowed('   ').allowed);
@@ -54,13 +63,33 @@ async function main(): Promise<void> {
   const port = (server.address() as any).port;
   const url = (path: string) => `ws://127.0.0.1:${port}${path}`;
 
-  const next = (ws: WebSocket): Promise<any> =>
+  const next = (ws: WebSocket, match?: (m: any) => boolean): Promise<any> =>
     new Promise((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error('timed out waiting for message')), 8000);
-      ws.once('message', (d) => {
+      const t = setTimeout(() => {
+        ws.off('message', handler);
+        ws.off('error', onError);
+        reject(new Error('timed out waiting for message'));
+      }, 8000);
+      const handler = (d: any): void => {
+        let m: any;
+        try {
+          m = JSON.parse(String(d));
+        } catch {
+          return;
+        }
+        if (match && !match(m)) return; // async broadcasts (sessions) pass through
         clearTimeout(t);
-        resolve(JSON.parse(String(d)));
-      });
+        ws.off('message', handler);
+        ws.off('error', onError);
+        resolve(m);
+      };
+      const onError = (e: unknown): void => {
+        clearTimeout(t);
+        ws.off('message', handler);
+        reject(e);
+      };
+      ws.on('message', handler);
+      ws.once('error', onError);
     });
 
   // Fake car: registers, answers execs with canned ELM replies.
@@ -102,7 +131,7 @@ async function main(): Promise<void> {
   const exec = async (cmd: string, extra: Record<string, unknown> = {}): Promise<any> => {
     const id = `t${++seq}`;
     con.send(JSON.stringify({ type: 'exec', id, sessionId, cmd, ...extra }));
-    return next(con);
+    return next(con, (m) => m?.type === 'result' && m?.id === id);
   };
 
   const r1 = await exec('22 5005');
@@ -113,6 +142,26 @@ async function main(): Promise<void> {
   check('AT SH passes through', r3.ok === true, r3);
   const r4 = await exec('22 5005', { sessionId: 'nope-missing' });
   check('unknown session errors', r4.ok === false && /no longer online/i.test(String(r4.error)), r4);
+
+  // Raw CAN toggle: UDS service blocked before, passes after, 04 still blocked.
+  const r5 = await exec('10 03');
+  check('UDS rejected without raw mode', r5.ok === false && /blocked/i.test(String(r5.error)), r5);
+  // Toggle acks carry no exec id (null), so they can't collide with results.
+  const rawAck = (m: any) => m.type === 'result' && (m.id === null || m.id === undefined);
+  con.send(JSON.stringify({ type: 'raw', sessionId }));
+  const rRaw0 = await next(con, rawAck);
+  check('raw toggle without flag is rejected', rRaw0.ok === false, rRaw0);
+  con.send(JSON.stringify({ type: 'raw', sessionId, on: true }));
+  const rRaw = await next(con, rawAck);
+  check('raw toggle acknowledged', rRaw.ok === true && rRaw.raw === true, rRaw);
+  const r6 = await exec('10 03');
+  check('UDS passes in raw mode', r6.ok === true, r6);
+  const r7 = await exec('04');
+  check('mode 04 still blocked in raw mode', r7.ok === false, r7);
+  con.send(JSON.stringify({ type: 'raw', sessionId, on: false }));
+  await next(con);
+  const r8 = await exec('10 03');
+  check('UDS blocked again after raw off', r8.ok === false, r8);
 
   // Non-admin token must not attach a console.
   const bad = new WebSocket(url('/ws/remote-console'));
