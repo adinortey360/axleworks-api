@@ -41,6 +41,11 @@ const ALLOWED_AT = /^(SH|CRA|AR|DPN?|RV|E[01]|L[01]|S[01]|H[01]|SP|ST|AT[012]|Z|
 /** Extra AT setup needed for raw UDS work (flow control, headers). */
 const RAW_EXTRA_AT = /^(FC|IFR|KW|MP)\b/i;
 
+/** Bounded CAN snapshot: "AT MA <seconds>" (1-15). The phone records
+ * locally and returns one digest - never an open stream. Bare "AT MA"
+ * stays blocked: it would flood the relay past every timeout. */
+const SNAPSHOT_RE = /^MA\s+([1-9]|1[0-5])$/;
+
 /**
  * Services that stay blocked even in raw mode. 04 wipes the very evidence
  * being collected remotely; 08 drives actuators on someone else's car.
@@ -53,6 +58,8 @@ export const RAW_WINDOW_MS = 15 * 60 * 1000;
 export interface SafetyVerdict {
   allowed: boolean;
   reason?: string;
+  /** Bounded CAN snapshot length in seconds (AT MA <n> form). */
+  snapshotSecs?: number;
 }
 
 /**
@@ -69,7 +76,9 @@ export function remoteCommandAllowed(rawCmd: string, rawMode = false): SafetyVer
     const at = cmd.slice(2).trim();
     if (ALLOWED_AT.test(at)) return { allowed: true };
     if (rawMode && RAW_EXTRA_AT.test(at)) return { allowed: true, reason: 'raw' };
-    if (/^(MA|MR|MT)\b/.test(at)) return { allowed: false, reason: 'monitor mode is blocked remotely (streams wedge the relay)' };
+    const snap = SNAPSHOT_RE.exec(at);
+    if (snap) return { allowed: true, reason: 'snapshot', snapshotSecs: parseInt(snap[1], 10) };
+    if (/^(MA|MR|MT)\b/.test(at)) return { allowed: false, reason: 'use "AT MA <seconds>" (1-15) for a bounded snapshot; open-ended monitor mode is blocked' };
     return { allowed: false, reason: `AT command not allowed remotely: ${at.split(/\s/)[0] || 'AT'}` };
   }
   // Service byte = first two hex digits (spaces stripped first, so '22 1940'
@@ -422,8 +431,11 @@ export function attachRemoteBridge(server: HttpServer, deps: RemoteBridgeDeps): 
           return;
         }
         const id = String(msg.id ?? `c${Date.now().toString(36)}${(seq++).toString(36)}`);
+        // Snapshots run seconds-long captures on the phone: budget the
+        // requested window plus headroom instead of the default timeout.
+        const floor = verdict.snapshotSecs != null ? verdict.snapshotSecs * 1000 + 10000 : 1000;
         const timeoutMs = Math.min(
-          Math.max(Number(msg.timeoutMs) || EXEC_TIMEOUT_MS, 1000),
+          Math.max(Number(msg.timeoutMs) || EXEC_TIMEOUT_MS, floor),
           MAX_EXEC_TIMEOUT_MS
         );
         const outcome = await new Promise<any>((resolve) => {
